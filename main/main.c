@@ -24,6 +24,12 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
+// WiFi + OTA
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "ota_http.h"
+
 // APIs de NimBLE Host 
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
@@ -48,6 +54,14 @@
 #define DEVICE_NAME                      "RD90Pro"
 #define BLE_GAP_APPEARANCE_GENERIC_TAG   0x0200
 #define BLE_GAP_LE_ROLE_PERIPHERAL       0x00
+
+
+//*****************************************WIFI + OTA*********************************************************/
+#define WIFI_SSID        "WTP TALLER"       /* <- Cambiar */
+#define WIFI_PASS        "24012024"         /* <- Cambiar */
+#define OTA_VERSION_URL  "https://raw.githubusercontent.com/SrMuchachita/Muchachota_C/main/version.json"
+#define OTA_FIRMWARE_URL "https://github.com/SrMuchachita/Muchachota_C/releases/latest/download/WP_C_V9_UP.bin"
+#define OTA_CHECK        20                   /* segundos entre chequeos */
 
 
 //*****************************************RECURSOS DE MODULO MAIN************************************************/
@@ -414,8 +428,61 @@ void IRAM_ATTR encoder_a_isr_handler (void *arg)
 /*****************************************************************************************************/
 //**************************************APP MAIN******************************************************/
 /*****************************************************************************************************/
+//**************************************WIFI + OTA****************************************************/
+
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "WiFi conectado. IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        ota_http_notify_connected();
+    }
+}
+
+static void wifi_init(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+    wifi_config_t wifi_cfg = {
+        .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "Conectando a '%s'...", WIFI_SSID);
+}
+
 void app_main(void)
 {
+    /* NVS — obligatorio antes de WiFi (vBleServiceInit tambien lo inicializa, es idempotente) */
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    /* WiFi + OTA en segundo plano (coexiste con BLE en el ESP32-S3) */
+    wifi_init();
+    ota_http_config_t ota_cfg = {
+        .version_url        = OTA_VERSION_URL,
+        .firmware_url       = OTA_FIRMWARE_URL,
+        .check_interval_sec = OTA_CHECK,
+    };
+    ota_http_start(&ota_cfg);
+
     vHardwareInit();
     vBleServiceInit();
 
@@ -832,10 +899,10 @@ void vTaskJoystickControl (void *pvParameters)
             hmi_send_data(HMI_REG_JOY2, ((int32_t)joy2_x << 16) | (int32_t)joy2_y);
             hmi_send_data(HMI_REG_P1,   (int32_t)p1_val);
 
-            ESP_LOGI(TAG, "J1X=%d J1Y=%d J2X=%d J2Y=%d P1=%d BTN1=%d BTN2=%d ENC=%ld",
-                joy1_x, joy1_y, joy2_x, joy2_y, p1_val,
-                (!gpio_get_level(J1_DIN1)), (!gpio_get_level(J2_DIN0)),
-                (long)encoder_count);
+            // ESP_LOGI(TAG, "J1X=%d J1Y=%d J2X=%d J2Y=%d P1=%d BTN1=%d BTN2=%d ENC=%ld",
+            //     joy1_x, joy1_y, joy2_x, joy2_y, p1_val,
+            //     (!gpio_get_level(J1_DIN1)), (!gpio_get_level(J2_DIN0)),
+            //     (long)encoder_count);
         }
 
         // Botones → HMI solo cuando cambia (1=presionado, 0=suelto)

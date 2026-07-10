@@ -1,0 +1,17 @@
+# Target — cambia esp32s3 por tu chip si es diferente
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash 4 MB — ajusta si tu modulo tiene mas (8MB, 16MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Partition table con slots OTA (obligatorio)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# Logs
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# HTTPS — bundle de certificados raiz (necesario para GitHub, Let's Encrypt, etc)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
