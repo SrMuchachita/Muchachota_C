@@ -15,6 +15,13 @@ static const char *TAG = "OTA_HTTP";
 static SemaphoreHandle_t s_wifi_ready = NULL;
 static ota_http_config_t s_cfg;
 
+static void notify_status(ota_http_status_t status)
+{
+    if (s_cfg.on_status) {
+        s_cfg.on_status(status);
+    }
+}
+
 /* ── API publica ──────────────────────────────────────────────────────────── */
 
 void ota_http_notify_connected(void)
@@ -78,6 +85,8 @@ static esp_err_t download_and_flash(void)
     esp_err_t err = esp_https_ota(&ota_cfg);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "OTA completo. Reiniciando...");
+        notify_status(OTA_HTTP_STATUS_SUCCESS);
+        vTaskDelay(pdMS_TO_TICKS(200)); /* da tiempo a que el HMI reciba el estado antes del reset */
         esp_restart();
     }
     return err;
@@ -94,23 +103,29 @@ static void ota_task(void *arg)
 
     while (1) {
         ESP_LOGI(TAG, "Consultando servidor...");
+        notify_status(OTA_HTTP_STATUS_CHECKING);
 
         char remote_ver[32] = {0};
 
         if (!fetch_remote_version(remote_ver, sizeof(remote_ver))) {
             ESP_LOGW(TAG, "Sin respuesta del servidor. Reintentando en %ds",
                      s_cfg.check_interval_sec);
+            notify_status(OTA_HTTP_STATUS_NO_RESPONSE);
         } else {
             ESP_LOGI(TAG, "Remota: v%s  |  Local: v%s", remote_ver, app->version);
 
             if (strcmp(remote_ver, app->version) != 0) {
                 ESP_LOGI(TAG, "Nueva version disponible. Actualizando...");
+                notify_status(OTA_HTTP_STATUS_UPDATING);
                 esp_err_t err = download_and_flash();
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "Fallo la actualizacion: %s", esp_err_to_name(err));
+                    notify_status(OTA_HTTP_STATUS_FAILED);
                 }
+                /* Si err == ESP_OK, download_and_flash() ya reinicio el equipo */
             } else {
                 ESP_LOGI(TAG, "Firmware al dia.");
+                notify_status(OTA_HTTP_STATUS_UP_TO_DATE);
             }
         }
 

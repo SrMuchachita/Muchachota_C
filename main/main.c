@@ -23,6 +23,7 @@
 #include "esp_err.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_app_desc.h"
 
 // WiFi + OTA
 #include "esp_wifi.h"
@@ -57,6 +58,7 @@
 
 
 //*****************************************WIFI + OTA*********************************************************/
+#define WIFI_OTA_ENABLED 0   /* En 0 desactiva WiFi+OTA (util para placas con antena externa aun no instalada, o debug) */
 #define WIFI_SSID        "WTP TALLER"       /* <- Cambiar */
 #define WIFI_PASS        "24012024"         /* <- Cambiar */
 #define OTA_VERSION_URL  "https://raw.githubusercontent.com/SrMuchachita/Muchachota_C/main/version.json"
@@ -85,6 +87,11 @@
 // INPUT NORMAL PULSADORES
 #define J1_DIN1      9
 #define J2_DIN0      3
+
+// En 1: boton J1 cicla intensidad de luz (25/50/75/100%/apagado) en vez de centrar servo3
+#define J1_BUTTON_LIGHT_MODE 1
+#define J1_LIGHT_PWM_MAX     1023  /* rango real del led_pwm del robot (TABLAS_MODBUS.md) */
+#define J1_LIGHT_STEPS       4     /* 25/50/75/100% */
 
 // INPUT ENCODER
 #define ENC_A_DIN0   12
@@ -191,6 +198,15 @@ typedef enum {
     HMI_REG_SRV1_ANGLE          = 0x1B,  // ángulo cabeza 0-180°
     HMI_REG_SRV2_ANGLE          = 0x1C,  // ángulo cuello 0-180°
     HMI_REG_SRV3_ANGLE          = 0x1D,  // ángulo servo3 0-270°
+    HMI_REG_OTA_STATUS          = 0x1E,  // estado OTA: ver ota_http_status_t (0=consultando,1=sin respuesta,2=al dia,3=actualizando,4=exito,5=fallo)
+    HMI_REG_FW_VERSION          = 0x1F,  // version firmware: bits[23:16]=major, [15:8]=minor, [7:0]=patch
+    HMI_REG_WIFI_STATUS         = 0x20,  // 1=conectado (con IP), 0=desconectado/conectando
+    HMI_REG_VIDEO_TECH          = 0x21,  // 1=boton presionado: apaga DOUT2 (LED) por 1s y luego lo restaura; 0=boton soltado (sin accion)
+    HMI_REG_VIDEO_TECH_B        = 0x22,  // igual que VIDEO_TECH pero para DOUT3 (LED B)
+    HMI_REG_WIFI_ENABLE         = 0x23,  // RX: 1=activa WiFi (conecta), 0=desactiva WiFi (desconecta). WiFi arranca OFF por defecto
+    HMI_REG_RL1                 = 0x24,  // RX: 1=enciende RL1 (coil 0x0004 del robot), 0=apaga
+    HMI_REG_ROBOT_MODEL         = 0x25,  // TX: modelo del robot (Modbus input 0x000C): 0=RD80, 1=RD90, 2=RD100
+    HMI_REG_RL2                 = 0x26,  // RX: 1=enciende RL2 (coil 0x0005 del robot), 0=apaga
     HMI_CMD_MAX
 } hmi_reg_t;
 
@@ -211,6 +227,8 @@ typedef struct {
     uint16_t srv2_angle;
     uint16_t led_pwm;
     uint16_t srv3_angle;
+    uint8_t  rl1;
+    uint8_t  rl2;
 } mb_master_cmd_t;
 
 static mb_master_cmd_t mb_cmd = {0};
@@ -278,7 +296,8 @@ void vTaskHmiTransmit    (void *pvParameters);
 void vTaskModbusControl  (void *pvParameters);
 void vTaskJoystickControl(void *pvParameters);
 void vTaskModbusWatchdog (void *pvParameters);
-void vTaskNimbleHost     (void *pvParameters);   
+void vTaskHmiBootWatchdog(void *pvParameters);
+void vTaskNimbleHost     (void *pvParameters);
 void vTaskNimbleNotify   (void *pvParameters);
 void vTaskGiroAutomatico (void *pvParameters);  // NUEVO
 
@@ -368,6 +387,8 @@ static uint16_t bleConnHandle = BLE_HS_CONN_HANDLE_NONE;
 //************************************** VARIABLES GLOBALES ****************************************************/
 static void  *mb_master_handle = NULL;
 static portMUX_TYPE paramLock  = portMUX_INITIALIZER_UNLOCKED;
+static esp_timer_handle_t s_video_tech_timer   = NULL;
+static esp_timer_handle_t s_video_tech_b_timer = NULL;
 
 volatile int64_t last_modbus_activity_time = 0;
 volatile int32_t encoder_count = 0;
@@ -377,9 +398,12 @@ static volatile bool mb_led_pwm_updated   = false;
 static volatile bool mb_servo_updated_joy = false;
 static volatile bool mb_servo_updated_hmi = false;
 static volatile bool mb_srv3_updated      = false;
+static volatile bool mb_rl1_updated       = false;
+static volatile bool mb_rl2_updated       = false;
 static volatile bool hmi_encoder_reset    = false;
 static volatile bool hmi_motor_override   = false;
 static volatile bool robot_online_flag    = false;
+static volatile bool s_hmi_ping_received  = false;  // primer PING del HMI recibido desde el boot
 
 // NUEVO: Variables para giro automático
 static volatile bool giro_auto_active = false;
@@ -430,17 +454,68 @@ void IRAM_ATTR encoder_a_isr_handler (void *arg)
 /*****************************************************************************************************/
 //**************************************WIFI + OTA****************************************************/
 
+#if WIFI_OTA_ENABLED
+
+static bool s_wifi_enabled = false; /* WiFi arranca OFF; se activa/desactiva desde HMI_REG_WIFI_ENABLE */
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        hmi_send_data(HMI_REG_WIFI_STATUS, 0);
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();
+        hmi_send_data(HMI_REG_WIFI_STATUS, 0);
+        if (s_wifi_enabled) {
+            esp_wifi_connect(); /* solo reintenta si el usuario no lo apago a proposito */
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi conectado. IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        hmi_send_data(HMI_REG_WIFI_STATUS, 1);
         ota_http_notify_connected();
+    }
+}
+
+static void wifi_set_enabled(bool enable); /* forward: usada abajo para auto-apagar tras el chequeo OTA */
+
+static void ota_status_to_hmi(ota_http_status_t status)
+{
+    hmi_send_data(HMI_REG_OTA_STATUS, (int32_t)status);
+
+    switch (status) {
+        case OTA_HTTP_STATUS_UP_TO_DATE:
+        case OTA_HTTP_STATUS_NO_RESPONSE:
+        case OTA_HTTP_STATUS_FAILED:
+            /* Chequeo terminado sin necesidad de reiniciar: apaga el WiFi hasta la
+             * proxima vez que el HMI lo vuelva a activar. (Si hubo exito, el equipo
+             * se reinicia solo y el WiFi ya arranca apagado por defecto). */
+            wifi_set_enabled(false);
+            break;
+        default:
+            break;
+    }
+}
+
+static void wifi_set_enabled(bool enable)
+{
+    if (enable == s_wifi_enabled) {
+        return;
+    }
+
+    if (enable) {
+        esp_err_t err = esp_wifi_start();
+        if (err == ESP_OK) {
+            s_wifi_enabled = true;
+            ESP_LOGI(TAG, "WiFi activado desde HMI, conectando a '%s'...", WIFI_SSID);
+        } else {
+            ESP_LOGE(TAG, "Error al activar WiFi: %s", esp_err_to_name(err));
+        }
+    } else {
+        esp_wifi_stop();
+        s_wifi_enabled = false;
+        hmi_send_data(HMI_REG_WIFI_STATUS, 0);
+        ESP_LOGI(TAG, "WiFi desactivado desde HMI");
     }
 }
 
@@ -460,9 +535,12 @@ static void wifi_init(void)
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "Conectando a '%s'...", WIFI_SSID);
+    /* WiFi arranca apagado a proposito: se activa desde el HMI (HMI_REG_WIFI_ENABLE) */
+    hmi_send_data(HMI_REG_WIFI_STATUS, 0);
+    ESP_LOGI(TAG, "WiFi configurado, en espera de activacion desde HMI");
 }
+
+#endif /* WIFI_OTA_ENABLED */
 
 void app_main(void)
 {
@@ -473,18 +551,6 @@ void app_main(void)
         nvs_ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_ret);
-
-    /* WiFi + OTA en segundo plano (coexiste con BLE en el ESP32-S3) */
-    wifi_init();
-    ota_http_config_t ota_cfg = {
-        .version_url        = OTA_VERSION_URL,
-        .firmware_url       = OTA_FIRMWARE_URL,
-        .check_interval_sec = OTA_CHECK,
-    };
-    ota_http_start(&ota_cfg);
-
-    vHardwareInit();
-    vBleServiceInit();
 
     xQueueHmiTx = xQueueCreate(50, sizeof(hmi_tx_frame_t));
     if(xQueueHmiTx == NULL) {
@@ -498,6 +564,23 @@ void app_main(void)
 		return;
     }
 
+    /* WiFi + OTA en segundo plano (coexiste con BLE en el ESP32-S3) */
+#if WIFI_OTA_ENABLED
+    wifi_init();
+    ota_http_config_t ota_cfg = {
+        .version_url        = OTA_VERSION_URL,
+        .firmware_url       = OTA_FIRMWARE_URL,
+        .check_interval_sec = OTA_CHECK,
+        .on_status          = ota_status_to_hmi,
+    };
+    ota_http_start(&ota_cfg);
+#else
+    ESP_LOGW(TAG, "WiFi+OTA desactivado (WIFI_OTA_ENABLED=0)");
+#endif
+
+    vHardwareInit();
+    vBleServiceInit();
+
     xTaskCreate(vTaskNimbleHost,      "NimBLE",     TASK_SIZE, NULL, 6, NULL);
     xTaskCreate(vTaskNimbleNotify,    "BleNotify",  TASK_SIZE, NULL, 3, NULL);
     xTaskCreate(vTaskHmiTransmit,     "HMI Tx",     TASK_SIZE, NULL, 3, NULL);
@@ -508,9 +591,14 @@ void app_main(void)
     xTaskCreate(vTaskEncoder,         "Encoder",    TASK_SIZE, NULL, 4, NULL);
     xTaskCreate(vTaskModbusControl,   "ModbusCtrl", TASK_SIZE, NULL, 6, NULL);
     xTaskCreate(vTaskModbusWatchdog,  "MbWatchdog", TASK_SIZE, NULL, 7, NULL);
+    xTaskCreate(vTaskHmiBootWatchdog, "HmiBootWdg", TASK_SIZE, NULL, 3, NULL);
     xTaskCreate(vTaskGiroAutomatico,  "GiroAuto",   TASK_SIZE, NULL, 5, NULL);  // NUEVO
 
     hmi_send_data(HMI_REG_PONG, 1);
+
+    int major = 0, minor = 0, patch = 0;
+    sscanf(esp_app_get_description()->version, "%d.%d.%d", &major, &minor, &patch);
+    hmi_send_data(HMI_REG_FW_VERSION, ((int32_t)major << 16) | ((int32_t)minor << 8) | (int32_t)patch);
 }
 
 
@@ -689,12 +777,17 @@ void vTaskJoystickControl (void *pvParameters)
     motor_dir_t cmd = MOTOR_STOP, prev_cmd = MOTOR_STOP;
     uint16_t vel = 0, prev_vel = 0;
 
+#if J1_BUTTON_LIGHT_MODE
+    uint8_t j1_light_step = 0;   /* 0=apagado, 1=25%, 2=50%, 3=75%, 4=100% */
+    int     j1_prev_level = 1;  /* pull-up: 1=suelto, 0=presionado */
+#endif
+
     srv1_angle = center_srv1; prev_srv1 = 0;
     srv2_angle = center_srv2; prev_srv2 = 0;
 
     target_srv1 = center_srv1;
     target_srv2 = center_srv2;
-
+ 
     const uint16_t SERVO_Y_INVERTED = 1;
     const uint16_t ADC_MAX       = 4095;
     const uint8_t  UPD_TIME      = 50;
@@ -827,11 +920,31 @@ void vTaskJoystickControl (void *pvParameters)
             target_srv2 = center_srv2;
         }
 
+#if J1_BUTTON_LIGHT_MODE
+        // J1 → cicla intensidad de luz (25/50/75/100%/apagado) por flanco de presion
+        {
+            int j1_level = gpio_get_level(J1_DIN1);
+            if (j1_prev_level == 1 && j1_level == 0) {
+                j1_light_step = (j1_light_step + 1) % (J1_LIGHT_STEPS + 1);
+                uint16_t pwm = (uint16_t)((uint32_t)j1_light_step * J1_LIGHT_PWM_MAX / J1_LIGHT_STEPS);
+
+                portENTER_CRITICAL(&paramLock);
+                mb_led_pwm_updated = true;
+                mb_cmd.led_pwm     = pwm;
+                portEXIT_CRITICAL(&paramLock);
+
+                hmi_send_data(HMI_REG_ROBOT_LED_CHANGED, (int32_t)pwm);
+                ESP_LOGI(TAG, "J1: intensidad de luz -> %d%% (pwm=%d)", j1_light_step * (100 / J1_LIGHT_STEPS), pwm);
+            }
+            j1_prev_level = j1_level;
+        }
+#else
         // J1 → centrar srv3
         if (gpio_get_level(J1_DIN1) == 0)
         {
             target_srv3 = center_srv3;
         }
+#endif
 
         // RAMPA SUAVE (1°)
         if (srv1_angle < target_srv1) {
@@ -927,6 +1040,7 @@ void vTaskModbusControl (void *pvParameters)
     uint16_t servo_data[2];
     uint16_t pwm_data;
     uint16_t srv3_data;
+    uint16_t rl_coil_data;
 
     const uint8_t  UPD_TIME = 50;
 
@@ -951,6 +1065,20 @@ void vTaskModbusControl (void *pvParameters)
         .reg_size   = 1,
     };
 
+    mb_param_request_t req_rl1 = {
+        .slave_addr = MB_SLAVE_ADDR,
+        .command    = 0x05,     // FC05 - Write Single Coil
+        .reg_start  = 0x0004,
+        .reg_size   = 1,
+    };
+
+    mb_param_request_t req_rl2 = {
+        .slave_addr = MB_SLAVE_ADDR,
+        .command    = 0x05,     // FC05 - Write Single Coil
+        .reg_start  = 0x0005,
+        .reg_size   = 1,
+    };
+
     mb_param_request_t req_srv3 = {
         .slave_addr = MB_SLAVE_ADDR,
         .command    = 0x10,
@@ -972,7 +1100,15 @@ void vTaskModbusControl (void *pvParameters)
         .reg_size   = 6,
     };
 
+    mb_param_request_t req_model = {
+        .slave_addr = MB_SLAVE_ADDR,
+        .command    = 0x04,
+        .reg_start  = 0x000C,
+        .reg_size   = 1,
+    };
+
     bool serial_read_done = false;
+    bool model_read_done  = false;
 
 
     while (1)
@@ -1028,6 +1164,32 @@ void vTaskModbusControl (void *pvParameters)
             }
         }
 
+        if (mb_rl1_updated)
+        {
+            portENTER_CRITICAL(&paramLock);
+            mb_rl1_updated = false;
+            rl_coil_data = mb_cmd.rl1 ? 0xFF00 : 0x0000;   // FC05: 0xFF00=ON, 0x0000=OFF
+            portEXIT_CRITICAL(&paramLock);
+
+            if(ESP_OK != mbc_master_send_request(mb_master_handle, &req_rl1, &rl_coil_data))
+            {
+                ESP_LOGE(TAG,"Error al enviar solicitud req_rl1");
+            }
+        }
+
+        if (mb_rl2_updated)
+        {
+            portENTER_CRITICAL(&paramLock);
+            mb_rl2_updated = false;
+            rl_coil_data = mb_cmd.rl2 ? 0xFF00 : 0x0000;   // FC05: 0xFF00=ON, 0x0000=OFF
+            portEXIT_CRITICAL(&paramLock);
+
+            if(ESP_OK != mbc_master_send_request(mb_master_handle, &req_rl2, &rl_coil_data))
+            {
+                ESP_LOGE(TAG,"Error al enviar solicitud req_rl2");
+            }
+        }
+
         int64_t now = esp_timer_get_time() / 1000;
 
         if ((now - last_read_time) >= 1000)
@@ -1056,30 +1218,60 @@ void vTaskModbusControl (void *pvParameters)
 
                 if (!serial_read_done) {
                     uint16_t serial_regs[6] = {0};
-                    if (ESP_OK == mbc_master_send_request(mb_master_handle, &req_serial, serial_regs)) {
-                        // Extraer los 6 chars ASCII del sufijo (regs 0x0009-0x000B)
-                        char suffix[7] = {
-                            (char)(serial_regs[3] >> 8),
-                            (char)(serial_regs[3] & 0xFF),
-                            (char)(serial_regs[4] >> 8),
-                            (char)(serial_regs[4] & 0xFF),
-                            (char)(serial_regs[5] >> 8),
-                            (char)(serial_regs[5] & 0xFF),
-                            '\0'
-                        };
-
-                        int32_t serial_num = 0;
+                    esp_err_t serial_err = mbc_master_send_request(mb_master_handle, &req_serial, serial_regs);
+                    if (ESP_OK == serial_err) {
+                        // Reconstruye el texto completo (12 chars, 2 por registro). El prefijo
+                        // ("RD90-", "RD80-", "RD90R-", etc.) puede variar segun el modelo/version
+                        // del robot, asi que no se asume una alineacion fija: se busca el '-' y
+                        // se toman los digitos que vienen despues.
+                        char raw[13];
                         for (int i = 0; i < 6; i++) {
-                            if (suffix[i] >= '0' && suffix[i] <= '9') {
-                                serial_num = serial_num * 10 + (suffix[i] - '0');
-                            }
+                            raw[i * 2]     = (char)(serial_regs[i] >> 8);
+                            raw[i * 2 + 1] = (char)(serial_regs[i] & 0xFF);
                         }
+                        raw[12] = '\0';
 
-                        hmi_send_data(HMI_REG_ROBOT_SERIAL, serial_num);
+                        const char *dash = strchr(raw, '-');
+                        if (dash) {
+                            char suffix[7] = {0};
+                            int j = 0;
+                            for (const char *p = dash + 1; *p != '\0' && j < 6; p++) {
+                                if (*p >= '0' && *p <= '9') {
+                                    suffix[j++] = *p;
+                                }
+                            }
 
-                        ESP_LOGI(TAG, "Robot serial: RD90R-%s (%ld)", suffix, (long)serial_num);
+                            if (j > 0) {
+                                int32_t serial_num = 0;
+                                for (int i = 0; i < j; i++) {
+                                    serial_num = serial_num * 10 + (suffix[i] - '0');
+                                }
 
-                        serial_read_done = true;
+                                hmi_send_data(HMI_REG_ROBOT_SERIAL, serial_num);
+
+                                ESP_LOGI(TAG, "Robot serial: %s (%ld)", raw, (long)serial_num);
+
+                                serial_read_done = true;
+                            } else {
+                                ESP_LOGW(TAG, "Robot serial: sin digitos tras '-' en '%s'", raw);
+                            }
+                        } else {
+                            ESP_LOGW(TAG, "Robot serial: formato inesperado '%s' (sin '-')", raw);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "Robot serial: pedido Modbus fallo: %s", esp_err_to_name(serial_err));
+                    }
+                }
+
+                if (!model_read_done) {
+                    uint16_t model_reg[1] = {0};
+                    esp_err_t model_err = mbc_master_send_request(mb_master_handle, &req_model, model_reg);
+                    if (ESP_OK == model_err) {
+                        hmi_send_data(HMI_REG_ROBOT_MODEL, (int32_t)model_reg[0]);
+                        ESP_LOGI(TAG, "Robot model: %u (0=RD80,1=RD90,2=RD100)", model_reg[0]);
+                        model_read_done = true;
+                    } else {
+                        ESP_LOGW(TAG, "Robot model: pedido Modbus fallo: %s", esp_err_to_name(model_err));
                     }
                 }
             }
@@ -1087,6 +1279,10 @@ void vTaskModbusControl (void *pvParameters)
             {
                 ESP_LOGW(TAG, "Error en lectura Modbus");
                 hmi_send_data(HMI_REG_ONLINE_INDICATOR, (int32_t)0);
+                // Robot desconectado: al reconectar hay que volver a leer serial y modelo
+                // (por si es un robot distinto), no asumir que siguen siendo los mismos.
+                serial_read_done = false;
+                model_read_done  = false;
             }
         }
 
@@ -1296,6 +1492,28 @@ void vTaskModbusWatchdog(void *pvParameters)
     }
 }
 
+// Watchdog de arranque: si a los HMI_BOOT_TIMEOUT_MS del boot nunca llegó ningún
+// PING del HMI, la consola quedó en un estado sin comunicación (típicamente por
+// una condición de carrera al encender ambas placas desde la misma fuente).
+// Se reinicia sola en vez de esperar a que alguien presione el botón de reset.
+void vTaskHmiBootWatchdog(void *pvParameters)
+{
+    const uint32_t HMI_BOOT_TIMEOUT_MS = 11000;
+
+    vTaskDelay(pdMS_TO_TICKS(HMI_BOOT_TIMEOUT_MS));
+
+    if (!s_hmi_ping_received)
+    {
+        ESP_LOGE(TAG, "Sin PING del HMI %lu ms despues del boot -> SYSTEM RESTART", (unsigned long)HMI_BOOT_TIMEOUT_MS);
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        esp_restart();
+    }
+
+    vTaskDelete(NULL);
+}
+
 //*************************************************************************************
 //*****************************FUNCIONES DE UTILIDAD **********************************
 //*************************************************************************************
@@ -1478,7 +1696,61 @@ void hmi_handle_reg(uint8_t reg, int32_t value)
         /*************************************************************/
 
         case HMI_REG_PING:
+        s_hmi_ping_received = true;
         hmi_send_data(HMI_REG_PONG, 1);
+        break;
+        /*************************************************************/
+
+        case HMI_REG_VIDEO_TECH:
+        if (value == 1) {
+            gpio_set_level(DOUT2, 0);
+            esp_timer_stop(s_video_tech_timer); /* por si ya estaba corriendo, reinicia el 1s */
+            esp_timer_start_once(s_video_tech_timer, 1000000);
+            ESP_LOGI(TAG, "HMI_REG_VIDEO_TECH: boton presionado, LED apagado 1s");
+        } else {
+            ESP_LOGI(TAG, "HMI_REG_VIDEO_TECH: boton soltado");
+        }
+        break;
+        /*************************************************************/
+
+        case HMI_REG_VIDEO_TECH_B:
+        if (value == 1) {
+            gpio_set_level(DOUT3, 0);
+            esp_timer_stop(s_video_tech_b_timer); /* por si ya estaba corriendo, reinicia el 1s */
+            esp_timer_start_once(s_video_tech_b_timer, 1000000);
+            ESP_LOGI(TAG, "HMI_REG_VIDEO_TECH_B: boton presionado, LED apagado 1s");
+        } else {
+            ESP_LOGI(TAG, "HMI_REG_VIDEO_TECH_B: boton soltado");
+        }
+        break;
+        /*************************************************************/
+
+        case HMI_REG_WIFI_ENABLE:
+#if WIFI_OTA_ENABLED
+        wifi_set_enabled(value == 1);
+#else
+        ESP_LOGW(TAG, "HMI_REG_WIFI_ENABLE ignorado (WIFI_OTA_ENABLED=0)");
+#endif
+        break;
+        /*************************************************************/
+
+        case HMI_REG_RL1:
+        portENTER_CRITICAL(&paramLock);
+        mb_rl1_updated = true;
+        mb_cmd.rl1     = (uint8_t)(value ? 1 : 0);
+        portEXIT_CRITICAL(&paramLock);
+
+        ESP_LOGI(TAG, "HMI_REG_RL1 = %d", value);
+        break;
+        /*************************************************************/
+
+        case HMI_REG_RL2:
+        portENTER_CRITICAL(&paramLock);
+        mb_rl2_updated = true;
+        mb_cmd.rl2     = (uint8_t)(value ? 1 : 0);
+        portEXIT_CRITICAL(&paramLock);
+
+        ESP_LOGI(TAG, "HMI_REG_RL2 = %d", value);
         break;
         /*************************************************************/
 
@@ -1609,7 +1881,17 @@ void vHardwareInit (void)
 	ESP_LOGI(TAG, "Configuracion de drivers ESP-IDF exitoso");
 }
 
-void vGpioInit(void) {	
+static void video_tech_led_restore_cb(void *arg)
+{
+    gpio_set_level(DOUT2, 1);
+}
+
+static void video_tech_b_led_restore_cb(void *arg)
+{
+    gpio_set_level(DOUT3, 1);
+}
+
+void vGpioInit(void) {
 	gpio_config_t gpio_out_cfg = {
 		.pin_bit_mask = DOUT_MASK_CONFIG,
 		.mode         = GPIO_MODE_INPUT_OUTPUT,
@@ -1618,10 +1900,22 @@ void vGpioInit(void) {
 		.intr_type    = GPIO_INTR_DISABLE,
 	};
 	gpio_config(&gpio_out_cfg);
-	
+
 	gpio_set_level(DOUT1, 0);
-	gpio_set_level(DOUT2, 0);
-	gpio_set_level(DOUT3, 0);
+	gpio_set_level(DOUT2, 1);  // LED siempre encendido por defecto (VIDEO_TECH lo apaga 1s al presionar)
+	gpio_set_level(DOUT3, 1);  // LED siempre encendido por defecto (VIDEO_TECH_B lo apaga 1s al presionar)
+
+	const esp_timer_create_args_t video_tech_timer_args = {
+		.callback = video_tech_led_restore_cb,
+		.name     = "video_tech_led",
+	};
+	esp_timer_create(&video_tech_timer_args, &s_video_tech_timer);
+
+	const esp_timer_create_args_t video_tech_b_timer_args = {
+		.callback = video_tech_b_led_restore_cb,
+		.name     = "video_tech_b_led",
+	};
+	esp_timer_create(&video_tech_b_timer_args, &s_video_tech_b_timer);
 
 	gpio_config_t gpio_in_cfg = {
 		.pin_bit_mask = DIN_MASK_CONFIG,
