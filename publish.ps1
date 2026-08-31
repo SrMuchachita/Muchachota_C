@@ -1,32 +1,44 @@
-# publish.ps1 — Compila, sube Release a GitHub y actualiza version.json
-# Uso: .\publish.ps1 "Descripcion de las mejoras de esta version"
-
 param(
     [string]$Notes = ""
 )
 
-$match = Select-String -Path "CMakeLists.txt" -Pattern 'project\(\w+ VERSION ([\d.]+)\)'
-if (-not $match) { Write-Error "No se encontro VERSION en CMakeLists.txt"; exit 1 }
-$version = $match.Matches[0].Groups[1].Value
-Write-Host "`n>>> Version detectada: $version`n" -ForegroundColor Cyan
+$ErrorActionPreference = "Stop"
 
-Write-Host ">>> Compilando..." -ForegroundColor Yellow
+$ProjectName = "WP_C_V9_UP"
+
+# --- Leer version desde project(NOMBRE VERSION x.x.x) en CMakeLists.txt ---
+$cmakeContent = Get-Content -Raw "CMakeLists.txt"
+if ($cmakeContent -notmatch 'project\s*\(\s*\S+\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') {
+    throw "No se encontro 'project(... VERSION x.x.x)' en CMakeLists.txt"
+}
+$version = $Matches[1]
+
+if ([string]::IsNullOrWhiteSpace($Notes)) {
+    $Notes = "Version $version"
+}
+
+Write-Host "Publicando version $version ..." -ForegroundColor Cyan
+
+# --- Compilar ---
 idf.py build
-if ($LASTEXITCODE -ne 0) { Write-Error "Build fallo"; exit 1 }
+if ($LASTEXITCODE -ne 0) { throw "idf.py build fallo" }
 
-if (-not $Notes) { $Notes = "Version $version" }
+$binPath = "build/$ProjectName.bin"
+if (-not (Test-Path $binPath)) {
+    throw "No se encontro $binPath luego del build"
+}
 
-Write-Host "`n>>> Creando Release v$version en GitHub..." -ForegroundColor Yellow
-gh release create "v$version" "build/WP_C_V9_UP.bin" `
-    --title "v$version" `
-    --notes "$Notes"
-if ($LASTEXITCODE -ne 0) { Write-Error "No se pudo crear el Release"; exit 1 }
+# --- Crear Release en GitHub y subir el .bin con su nombre real ---
+gh release create "v$version" "$binPath" --title "v$version" --notes "$Notes"
+if ($LASTEXITCODE -ne 0) { throw "gh release create fallo" }
 
-Write-Host "`n>>> Actualizando version.json..." -ForegroundColor Yellow
-Set-Content -Path "version.json" -Value "{`"version`":`"$version`"}" -NoNewline
+# --- Actualizar version.json ---
+Set-Content -Path "version.json" -Value "{`"version`":`"$version`"}" -Encoding utf8 -NoNewline
+Add-Content -Path "version.json" -Value "`n"
 
+# --- Commit y push ---
 git add version.json
 git commit -m "v$version"
 git push
 
-Write-Host "`n>>> Listo! El ESP32 se actualizara en el proximo chequeo.`n" -ForegroundColor Green
+Write-Host "Release v$version publicado correctamente." -ForegroundColor Green

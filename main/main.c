@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 // ESP-IDF Drivers
 #include "driver/gptimer.h"
@@ -207,6 +208,58 @@ typedef enum {
     HMI_REG_RL1                 = 0x24,  // RX: 1=enciende RL1 (coil 0x0004 del robot), 0=apaga
     HMI_REG_ROBOT_MODEL         = 0x25,  // TX: modelo del robot (Modbus input 0x000C): 0=RD80, 1=RD90, 2=RD100
     HMI_REG_RL2                 = 0x26,  // RX: 1=enciende RL2 (coil 0x0005 del robot), 0=apaga
+    HMI_REG_BLUETOOTH_MAC_HI    = 0x29,  // TX: MAC BLE del dispositivo conectado, bits[15:0]=bytes 5-4
+    HMI_REG_BLUETOOTH_MAC_LO    = 0x2A,  // TX: MAC BLE del dispositivo conectado, bytes 3-0 (manda despues de MAC_HI)
+
+    // ================================================================
+    // PENDIENTE DEL LADO DEL HMI (para el que hace la UI):
+    //   Este registro ya esta implementado y probado del lado de la consola.
+    //   Falta unicamente: agregar un boton en la pantalla (ej. cerca de donde
+    //   se muestra la MAC/password BLE) que, al presionarlo, llame a:
+    //
+    //       hmi_send_data(HMI_REG_BLUETOOTH_DISCONNECT, 1);
+    //
+    //   Con eso alcanza. La consola se encarga de:
+    //     1) Cortar la conexion BLE actual (ble_gap_terminate).
+    //     2) Volver a modo emparejamiento sola (startAdvertising(), ya
+    //        disparado automaticamente por el evento de desconexion).
+    //     3) Avisarle al HMI que ya no hay nadie conectado
+    //        (HMI_REG_BLUETOOTH_INDICATOR = 0), para apagar el LED solo.
+    //   No hace falta agregar nada mas en la consola para esta funcion.
+    // ================================================================
+    HMI_REG_BLUETOOTH_DISCONNECT = 0x2B, // RX: 1=desconecta el dispositivo BLE actual y vuelve a modo emparejamiento (advertising)
+
+    // ================================================================
+    // PENDIENTE DEL LADO DEL HMI (para el que hace la UI):
+    //   Igual que BLUETOOTH_DISCONNECT: ya esta implementado y probado del
+    //   lado de la consola. Falta un boton (ej. "Bloquear este dispositivo")
+    //   que llame a:
+    //
+    //       hmi_send_data(HMI_REG_BLUETOOTH_BLOCK, 1);
+    //
+    //   La consola se encarga de: guardar la MAC del dispositivo conectado
+    //   en una lista negra persistente (NVS, sobrevive a reinicios/apagados),
+    //   desconectarlo, y a partir de ahi rechazar automaticamente cualquier
+    //   conexion futura que venga de esa misma MAC. Maximo 5 MACs bloqueadas
+    //   (BLE_BLOCK_MAX_MACS); si se llena, se descarta el bloqueo mas viejo
+    //   para hacer lugar al nuevo. Ver HMI_REG_BLUETOOTH_UNBLOCK_ALL mas abajo
+    //   para borrar la lista completa (no hay desbloqueo individual, ver por que).
+    // ================================================================
+    HMI_REG_BLUETOOTH_BLOCK      = 0x2C, // RX: 1=bloquea (lista negra) y desconecta el dispositivo BLE actual
+
+    // ================================================================
+    // PENDIENTE DEL LADO DEL HMI (para el que hace la UI):
+    //   Ya esta implementado y probado del lado de la consola. Falta un
+    //   boton (ej. "Borrar bloqueados") que llame a:
+    //
+    //       hmi_send_data(HMI_REG_BLUETOOTH_UNBLOCK_ALL, 1);
+    //
+    //   Esto borra TODA la lista negra de una (no hay forma de desbloquear
+    //   una MAC puntual sin borrar las demas — para eso el HMI necesitaria
+    //   mostrar la lista completa de MACs bloqueadas, que hoy no existe;
+    //   se puede agregar mas adelante si hace falta desbloqueo individual).
+    // ================================================================
+    HMI_REG_BLUETOOTH_UNBLOCK_ALL = 0x2D, // RX: 1=borra toda la lista negra de MACs BLE bloqueadas
     HMI_CMD_MAX
 } hmi_reg_t;
 
@@ -266,6 +319,11 @@ void save_center_to_nvs(void);
 void load_center_from_nvs(void);
 void save_limits_to_nvs(void);
 void load_limits_from_nvs(void);
+void load_ble_blocklist_from_nvs(void);
+void save_ble_blocklist_to_nvs(void);
+bool ble_mac_is_blocked(const uint8_t *mac);
+void ble_mac_block_add(const uint8_t *mac);
+void ble_mac_block_clear_all(void);
 
 
 //**************************************PROTOTIPOS DE FUNCIONES BLE *********************************************/
@@ -306,6 +364,13 @@ void vTaskGiroAutomatico (void *pvParameters);  // NUEVO
 static QueueHandle_t xQueueHmiTx     = NULL;
 static QueueHandle_t xQueueHmiRx     = NULL;
 static QueueHandle_t xQueueUartEvent = NULL;
+
+// Protege el periferico HMI_UART_PORT entre vTaskHmiTransmit (uart_write_bytes)
+// y vTaskUartHmiEvents (uart_driver_delete + reinstall al recuperarse de un
+// UART_BREAK). Sin este lock hay una condicion de carrera real: si se llega a
+// borrar/reinstalar el driver justo mientras el otro task esta escribiendo en
+// el mismo puerto, es acceso a memoria invalida -> panic/crash del chip.
+static SemaphoreHandle_t s_hmi_uart_mutex = NULL;
 
 
 //************************************** RECURSOS DE BLE ****************************************************/
@@ -383,6 +448,12 @@ uint8_t ownAddrType = 0;
 uint8_t addrVal[6]  = {0};
 static uint16_t bleConnHandle = BLE_HS_CONN_HANDLE_NONE;
 
+// Lista negra de MACs BLE bloqueadas (HMI_REG_BLUETOOTH_BLOCK), persistente en NVS
+#define BLE_BLOCK_MAX_MACS   5
+#define NVS_KEY_BLE_BLOCKLIST "ble_block"
+static uint8_t s_blocked_macs[BLE_BLOCK_MAX_MACS][6];
+static uint8_t s_blocked_count = 0;
+
 
 //************************************** VARIABLES GLOBALES ****************************************************/
 static void  *mb_master_handle = NULL;
@@ -403,7 +474,7 @@ static volatile bool mb_rl2_updated       = false;
 static volatile bool hmi_encoder_reset    = false;
 static volatile bool hmi_motor_override   = false;
 static volatile bool robot_online_flag    = false;
-static volatile bool s_hmi_ping_received  = false;  // primer PING del HMI recibido desde el boot
+static volatile uint32_t s_last_hmi_ping_ms = 0;  // timestamp (ms de uptime) del ultimo PING valido recibido del HMI
 
 // NUEVO: Variables para giro automático
 static volatile bool giro_auto_active = false;
@@ -908,7 +979,14 @@ void vTaskJoystickControl (void *pvParameters)
         if (srv3_angle < target_srv3) srv3_angle++;
         else if (srv3_angle > target_srv3) srv3_angle--;
 
-        // J2 → centrar srv1/srv2 y cancelar giro automático
+        // J2 → centrar srv1/srv2 y cancelar giro automático.
+        // Mantenido 5s o mas: reinicia la consola (mismo mecanismo seguro que
+        // usan los watchdogs -- para el motor primero y le da tiempo a salir
+        // por Modbus antes de reiniciar).
+        static int64_t s_center_btn_press_start_us = 0;
+        static bool    s_center_btn_restart_triggered = false;
+        const int64_t  CENTER_BTN_RESTART_US = 5000000;  // 5s
+
         if (gpio_get_level(J2_DIN0) == 0)
         {
             if (giro_auto_active) {
@@ -918,6 +996,28 @@ void vTaskJoystickControl (void *pvParameters)
             }
             target_srv1 = center_srv1;
             target_srv2 = center_srv2;
+
+            if (s_center_btn_press_start_us == 0) {
+                s_center_btn_press_start_us = esp_timer_get_time();
+            } else if (!s_center_btn_restart_triggered &&
+                       (esp_timer_get_time() - s_center_btn_press_start_us) >= CENTER_BTN_RESTART_US) {
+                s_center_btn_restart_triggered = true;
+                ESP_LOGW(TAG, "Boton de centrado mantenido 5s -> parando motor y reiniciando consola");
+
+                portENTER_CRITICAL(&paramLock);
+                mb_cmd.motor_cmd = MOTOR_STOP;
+                mb_cmd.motor_vel = 0;
+                portEXIT_CRITICAL(&paramLock);
+
+                vTaskDelay(pdMS_TO_TICKS(600));
+
+                esp_restart();
+            }
+        }
+        else
+        {
+            s_center_btn_press_start_us   = 0;
+            s_center_btn_restart_triggered = false;
         }
 
 #if J1_BUTTON_LIGHT_MODE
@@ -1044,6 +1144,17 @@ void vTaskModbusControl (void *pvParameters)
 
     const uint8_t  UPD_TIME = 50;
 
+    // Backoff cuando el robot no contesta: sin esto, con el robot desconectado
+    // este task (prioridad 6, mas alta que las tareas de UART del HMI) se la
+    // pasa reintentando Modbus cada ~50-150ms sin parar, indefinidamente. Eso
+    // le deja menos aire al scheduler para las tareas de UART del HMI y podia
+    // estar relacionado con perdidas intermitentes de PING/PONG. Si el robot
+    // no contesta varias veces seguidas, se espacian mas los reintentos; en
+    // cuanto vuelve a contestar, se resetea el backoff al toque.
+    const uint8_t  MODBUS_BACKOFF_THRESHOLD  = 10;   // ~1s de fallas seguidas
+    const uint32_t MODBUS_BACKOFF_EXTRA_MS   = 250;
+    uint32_t consecutive_motor_failures = 0;
+
     mb_param_request_t req_motor = {
         .slave_addr = MB_SLAVE_ADDR,
         .command    = 0x10,
@@ -1110,6 +1221,18 @@ void vTaskModbusControl (void *pvParameters)
     bool serial_read_done = false;
     bool model_read_done  = false;
 
+    // El HMI puede no estar listo (pantallas LVGL aun sin construir) en el
+    // instante en que llega el primer envio de serial/modelo, y como el HMI
+    // ignora en silencio un registro para el que todavia no tiene objeto de
+    // UI, ese primer envio se puede perder sin aviso. Se reintenta el envio
+    // (no la lectura Modbus, que ya salio bien) unas cuantas veces mas para
+    // cubrir esa ventana de arranque del HMI.
+    const int HMI_INFO_RESEND_COUNT = 9;  // + el envio inicial = 10 intentos en ~10s
+    int32_t  cached_serial_num  = 0;
+    uint16_t cached_model       = 0;
+    int      serial_resend_left = 0;
+    int      model_resend_left  = 0;
+
 
     while (1)
     {
@@ -1118,7 +1241,8 @@ void vTaskModbusControl (void *pvParameters)
         motor_data[1] = mb_cmd.motor_vel;
         portEXIT_CRITICAL(&paramLock);
 
-        if(ESP_OK != mbc_master_send_request(mb_master_handle, &req_motor, motor_data)) 
+        bool motor_req_ok = (ESP_OK == mbc_master_send_request(mb_master_handle, &req_motor, motor_data));
+        if (!motor_req_ok)
         {
             ESP_LOGE(TAG,"Error al enviar solicitud req_motor");
         }
@@ -1247,11 +1371,13 @@ void vTaskModbusControl (void *pvParameters)
                                     serial_num = serial_num * 10 + (suffix[i] - '0');
                                 }
 
+                                cached_serial_num = serial_num;
                                 hmi_send_data(HMI_REG_ROBOT_SERIAL, serial_num);
 
                                 ESP_LOGI(TAG, "Robot serial: %s (%ld)", raw, (long)serial_num);
 
-                                serial_read_done = true;
+                                serial_read_done   = true;
+                                serial_resend_left = HMI_INFO_RESEND_COUNT;
                             } else {
                                 ESP_LOGW(TAG, "Robot serial: sin digitos tras '-' en '%s'", raw);
                             }
@@ -1261,18 +1387,26 @@ void vTaskModbusControl (void *pvParameters)
                     } else {
                         ESP_LOGW(TAG, "Robot serial: pedido Modbus fallo: %s", esp_err_to_name(serial_err));
                     }
+                } else if (serial_resend_left > 0) {
+                    hmi_send_data(HMI_REG_ROBOT_SERIAL, cached_serial_num);
+                    serial_resend_left--;
                 }
 
                 if (!model_read_done) {
                     uint16_t model_reg[1] = {0};
                     esp_err_t model_err = mbc_master_send_request(mb_master_handle, &req_model, model_reg);
                     if (ESP_OK == model_err) {
+                        cached_model = model_reg[0];
                         hmi_send_data(HMI_REG_ROBOT_MODEL, (int32_t)model_reg[0]);
                         ESP_LOGI(TAG, "Robot model: %u (0=RD80,1=RD90,2=RD100)", model_reg[0]);
-                        model_read_done = true;
+                        model_read_done   = true;
+                        model_resend_left = HMI_INFO_RESEND_COUNT;
                     } else {
                         ESP_LOGW(TAG, "Robot model: pedido Modbus fallo: %s", esp_err_to_name(model_err));
                     }
+                } else if (model_resend_left > 0) {
+                    hmi_send_data(HMI_REG_ROBOT_MODEL, (int32_t)cached_model);
+                    model_resend_left--;
                 }
             }
             else
@@ -1281,14 +1415,26 @@ void vTaskModbusControl (void *pvParameters)
                 hmi_send_data(HMI_REG_ONLINE_INDICATOR, (int32_t)0);
                 // Robot desconectado: al reconectar hay que volver a leer serial y modelo
                 // (por si es un robot distinto), no asumir que siguen siendo los mismos.
-                serial_read_done = false;
-                model_read_done  = false;
+                serial_read_done   = false;
+                model_read_done    = false;
+                serial_resend_left = 0;
+                model_resend_left  = 0;
             }
         }
 
         last_modbus_activity_time = esp_timer_get_time() / 1000;
 
+        if (motor_req_ok) {
+            consecutive_motor_failures = 0;
+        } else if (consecutive_motor_failures < UINT32_MAX) {
+            consecutive_motor_failures++;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(UPD_TIME));
+
+        if (consecutive_motor_failures >= MODBUS_BACKOFF_THRESHOLD) {
+            vTaskDelay(pdMS_TO_TICKS(MODBUS_BACKOFF_EXTRA_MS));
+        }
     }
 }
 
@@ -1399,7 +1545,9 @@ void vTaskHmiTransmit(void *pvParameters)
             frame[5] = (txFrame.value >> 8);
             frame[6] = (txFrame.value);
 
+            if (s_hmi_uart_mutex != NULL) xSemaphoreTake(s_hmi_uart_mutex, portMAX_DELAY);
             int sent = uart_write_bytes(HMI_UART_PORT, frame, sizeof(frame));
+            if (s_hmi_uart_mutex != NULL) xSemaphoreGive(s_hmi_uart_mutex);
             if (sent != sizeof(frame)) {
                 ESP_LOGE(TAG, "HMI TX error: reg=0x%02X sent=%d", txFrame.reg, sent);
             } else {
@@ -1415,17 +1563,27 @@ void vTaskUartHmiEvents  (void *pvParameters) {
     uart_event_t event;
     hmi_rx_frame_t rx_frame;
 
+    // Si el periferico UART queda "trabado" (linea RX pegada en bajo, el
+    // driver reporta UART_BREAK sin parar y nunca vuelve a ver UART_DATA
+    // valido), reinstalarlo desde cero suele destrabarlo. Es un reset
+    // acotado solo a este periferico UART -- no toca Modbus, BLE, ni el
+    // control de motores, a diferencia de un esp_restart() del chip entero.
+    const int UART_BREAK_RECOVER_THRESHOLD = 15;  // ~15 eventos seguidos sin dato valido
+    int uart_break_streak = 0;
+
     while (1) {
-	    if(pdTRUE == xQueueReceive(xQueueUartEvent, (void *)&event, pdMS_TO_TICKS(1000))) 
+	    if(pdTRUE == xQueueReceive(xQueueUartEvent, (void *)&event, pdMS_TO_TICKS(1000)))
         {
 	        bzero(rx_frame.buffer, sizeof(rx_frame.buffer));
-	        
-	        switch (event.type) 
+
+	        switch (event.type)
             {
-                case UART_DATA:	  
+                case UART_DATA:
+                    uart_break_streak = 0;
+
                     rx_frame.len = event.size;
 
-                    if (rx_frame.len > sizeof(rx_frame.buffer)) 
+                    if (rx_frame.len > sizeof(rx_frame.buffer))
                     {
                         rx_frame.len = sizeof(rx_frame.buffer);
                     }
@@ -1434,23 +1592,39 @@ void vTaskUartHmiEvents  (void *pvParameters) {
 
                     if(pdFALSE == xQueueSendToBack(xQueueHmiRx, &rx_frame, pdMS_TO_TICKS(10))) {
                         ESP_LOGE(TAG, "HMI_UART_PORT: UART_DATA, Cola Llena");
-                    }  
+                    }
                 break;
-                    
+
                 case UART_FIFO_OVF:
                     ESP_LOGE(TAG, "UART_HMI_PORT: UART_FIFO_OVF");
                     uart_flush_input(HMI_UART_PORT);
                     xQueueReset(xQueueUartEvent);
                 break;
-                    
+
                 case UART_BUFFER_FULL:
                     ESP_LOGE(TAG, "UART_HMI_PORT: UART_BUFFER_FULL");
                     uart_flush_input(HMI_UART_PORT);
                     xQueueReset(xQueueUartEvent);
                 break;
-                    
+
                 case UART_BREAK:
                     ESP_LOGE(TAG, "UART_HMI_PORT: UART_BREAK");
+                    uart_flush_input(HMI_UART_PORT);
+
+                    uart_break_streak++;
+                    if (uart_break_streak >= UART_BREAK_RECOVER_THRESHOLD) {
+                        ESP_LOGW(TAG, "UART_HMI_PORT: %d BREAK seguidos -> reinstalando driver UART (no afecta Modbus/BLE/motores)",
+                            uart_break_streak);
+                        uart_break_streak = 0;
+
+                        // Bloquear a vTaskHmiTransmit mientras se borra/reinstala el
+                        // driver: escribir en un puerto cuyo driver se acaba de
+                        // borrar es acceso a memoria invalida.
+                        if (s_hmi_uart_mutex != NULL) xSemaphoreTake(s_hmi_uart_mutex, portMAX_DELAY);
+                        uart_driver_delete(HMI_UART_PORT);
+                        vUartInit();  // reinstala driver + recrea xQueueUartEvent
+                        if (s_hmi_uart_mutex != NULL) xSemaphoreGive(s_hmi_uart_mutex);
+                    }
                 break;
                     
                 case UART_PARITY_ERR:
@@ -1492,26 +1666,50 @@ void vTaskModbusWatchdog(void *pvParameters)
     }
 }
 
-// Watchdog de arranque: si a los HMI_BOOT_TIMEOUT_MS del boot nunca llegó ningún
-// PING del HMI, la consola quedó en un estado sin comunicación (típicamente por
-// una condición de carrera al encender ambas placas desde la misma fuente).
-// Se reinicia sola en vez de esperar a que alguien presione el botón de reset.
+// Watchdog de comunicacion con el HMI: si pasan mas de HMI_PING_TIMEOUT_MS sin
+// recibir un PING valido, la consola quedo sin comunicacion (tipicamente por
+// una condicion de carrera al encender ambas placas desde la misma fuente, o
+// porque la linea UART quedo en un estado que el reinstall del driver -ver
+// vTaskUartHmiEvents/UART_BREAK- no alcanza a destrabar del todo).
+//
+// OJO: es un chequeo CONTINUO (no una sola vez al boot). Con un chequeo unico,
+// un solo byte de ruido que por casualidad calce con la cabecera/registro de
+// PING (confirmado en la practica: aparecian "Unknown REG" con la linea rota)
+// alcanzaba para marcar "ping recibido" para siempre y desactivar el watchdog
+// aunque nunca hubiera comunicacion real despues. Ahora se guarda el timestamp
+// del ULTIMO ping valido y se revisa cada 1s cuanto hace que no llega uno nuevo.
 void vTaskHmiBootWatchdog(void *pvParameters)
 {
-    const uint32_t HMI_BOOT_TIMEOUT_MS = 11000;
+    const uint32_t HMI_PING_TIMEOUT_MS  = 11000;
+    const uint32_t CHECK_PERIOD_MS      = 1000;
 
-    vTaskDelay(pdMS_TO_TICKS(HMI_BOOT_TIMEOUT_MS));
+    // Punto de partida: "ahora" (no 0), para darle el margen inicial de
+    // HMI_PING_TIMEOUT_MS antes del primer chequeo, igual que al boot.
+    s_last_hmi_ping_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
-    if (!s_hmi_ping_received)
+    while (1)
     {
-        ESP_LOGE(TAG, "Sin PING del HMI %lu ms despues del boot -> SYSTEM RESTART", (unsigned long)HMI_BOOT_TIMEOUT_MS);
+        vTaskDelay(pdMS_TO_TICKS(CHECK_PERIOD_MS));
 
-        vTaskDelay(pdMS_TO_TICKS(200));
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
-        esp_restart();
+        if ((now_ms - s_last_hmi_ping_ms) > HMI_PING_TIMEOUT_MS)
+        {
+            ESP_LOGE(TAG, "Sin PING del HMI hace %lu ms -> parando motor y reiniciando",
+                (unsigned long)(now_ms - s_last_hmi_ping_ms));
+
+            portENTER_CRITICAL(&paramLock);
+            mb_cmd.motor_cmd = MOTOR_STOP;
+            mb_cmd.motor_vel = 0;
+            portEXIT_CRITICAL(&paramLock);
+
+            // Varios ciclos de vTaskModbusControl para darle chance real de salir
+            // por Modbus (cada intento puede tardar hasta ~150ms si hay timeout).
+            vTaskDelay(pdMS_TO_TICKS(600));
+
+            esp_restart();
+        }
     }
-
-    vTaskDelete(NULL);
 }
 
 //*************************************************************************************
@@ -1696,7 +1894,7 @@ void hmi_handle_reg(uint8_t reg, int32_t value)
         /*************************************************************/
 
         case HMI_REG_PING:
-        s_hmi_ping_received = true;
+        s_last_hmi_ping_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
         hmi_send_data(HMI_REG_PONG, 1);
         break;
         /*************************************************************/
@@ -1751,6 +1949,44 @@ void hmi_handle_reg(uint8_t reg, int32_t value)
         portEXIT_CRITICAL(&paramLock);
 
         ESP_LOGI(TAG, "HMI_REG_RL2 = %d", value);
+        break;
+        /*************************************************************/
+
+        case HMI_REG_BLUETOOTH_DISCONNECT:
+        if (value == 1) {
+            if (bleConnHandle != BLE_HS_CONN_HANDLE_NONE) {
+                ESP_LOGW(TAG, "HMI_REG_BLUETOOTH_DISCONNECT: desconectando dispositivo BLE actual");
+                // BLE_GAP_EVENT_DISCONNECT (gapEventHandler) ya llama a startAdvertising()
+                // al desconectarse, asi que esto solo con terminar la conexion alcanza
+                // para volver a modo emparejamiento.
+                ble_gap_terminate(bleConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+            } else {
+                ESP_LOGW(TAG, "HMI_REG_BLUETOOTH_DISCONNECT: no hay dispositivo BLE conectado");
+            }
+        }
+        break;
+        /*************************************************************/
+
+        case HMI_REG_BLUETOOTH_BLOCK:
+        if (value == 1) {
+            if (bleConnHandle != BLE_HS_CONN_HANDLE_NONE) {
+                struct ble_gap_conn_desc desc;
+                if (ble_gap_conn_find(bleConnHandle, &desc) == 0) {
+                    ble_mac_block_add(desc.peer_id_addr.val);
+                }
+                ESP_LOGW(TAG, "HMI_REG_BLUETOOTH_BLOCK: bloqueando y desconectando dispositivo BLE actual");
+                ble_gap_terminate(bleConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+            } else {
+                ESP_LOGW(TAG, "HMI_REG_BLUETOOTH_BLOCK: no hay dispositivo BLE conectado");
+            }
+        }
+        break;
+        /*************************************************************/
+
+        case HMI_REG_BLUETOOTH_UNBLOCK_ALL:
+        if (value == 1) {
+            ble_mac_block_clear_all();
+        }
         break;
         /*************************************************************/
 
@@ -1820,6 +2056,76 @@ void load_limits_from_nvs(void)
     }
 }
 
+void save_ble_blocklist_to_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        // blob: 1 byte de cantidad + hasta BLE_BLOCK_MAX_MACS*6 bytes de MACs
+        uint8_t blob[1 + BLE_BLOCK_MAX_MACS * 6];
+        blob[0] = s_blocked_count;
+        memcpy(&blob[1], s_blocked_macs, s_blocked_count * 6);
+        nvs_set_blob(handle, NVS_KEY_BLE_BLOCKLIST, blob, 1 + s_blocked_count * 6);
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Lista negra BLE guardada en NVS (%d MAC/s)", s_blocked_count);
+    }
+}
+
+void load_ble_blocklist_from_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+        uint8_t blob[1 + BLE_BLOCK_MAX_MACS * 6];
+        size_t len = sizeof(blob);
+        if (nvs_get_blob(handle, NVS_KEY_BLE_BLOCKLIST, blob, &len) == ESP_OK && len >= 1) {
+            uint8_t count = blob[0];
+            if (count > BLE_BLOCK_MAX_MACS) count = BLE_BLOCK_MAX_MACS;
+            s_blocked_count = count;
+            memcpy(s_blocked_macs, &blob[1], count * 6);
+            ESP_LOGI(TAG, "Lista negra BLE cargada de NVS (%d MAC/s)", s_blocked_count);
+        }
+        nvs_close(handle);
+    }
+}
+
+bool ble_mac_is_blocked(const uint8_t *mac)
+{
+    for (int i = 0; i < s_blocked_count; i++) {
+        if (memcmp(s_blocked_macs[i], mac, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ble_mac_block_add(const uint8_t *mac)
+{
+    if (ble_mac_is_blocked(mac)) {
+        return;  // ya estaba bloqueada, nada que hacer
+    }
+
+    if (s_blocked_count >= BLE_BLOCK_MAX_MACS) {
+        // Lista llena: se descarta la mas vieja (indice 0) para hacer lugar
+        memmove(&s_blocked_macs[0], &s_blocked_macs[1], (BLE_BLOCK_MAX_MACS - 1) * 6);
+        s_blocked_count = BLE_BLOCK_MAX_MACS - 1;
+    }
+
+    memcpy(s_blocked_macs[s_blocked_count], mac, 6);
+    s_blocked_count++;
+
+    save_ble_blocklist_to_nvs();
+
+    ESP_LOGW(TAG, "MAC BLE bloqueada: %02X:%02X:%02X:%02X:%02X:%02X",
+        mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+}
+
+void ble_mac_block_clear_all(void)
+{
+    s_blocked_count = 0;
+    save_ble_blocklist_to_nvs();
+    ESP_LOGW(TAG, "Lista negra BLE borrada por completo");
+}
+
 void hmi_send_data(uint8_t reg, int32_t value)
 {
     hmi_tx_frame_t frame = {
@@ -1877,6 +2183,7 @@ void vHardwareInit (void)
 	vMbMasterInit();
     load_center_from_nvs();
     load_limits_from_nvs();
+    load_ble_blocklist_from_nvs();
 
 	ESP_LOGI(TAG, "Configuracion de drivers ESP-IDF exitoso");
 }
@@ -1982,6 +2289,10 @@ void vUartInit(void)
     uart_set_pin(HMI_UART_PORT, HMI_UART_TXD, HMI_UART_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
     uart_driver_install(HMI_UART_PORT, UART_BUFFER_SIZE, UART_BUFFER_SIZE, 20, &xQueueUartEvent, 0);
+
+    if (s_hmi_uart_mutex == NULL) {
+        s_hmi_uart_mutex = xSemaphoreCreateMutex();
+    }
 }
 
 void vMbMasterInit(void) {
@@ -2212,9 +2523,33 @@ int gapEventHandler (struct ble_gap_event *event, void *arg)
             ESP_LOGW(TAG, "BLE_GAP_EVENT_CONNECT");
 
             if (event->connect.status == 0) {
-                bleConnHandle = event->connect.conn_handle;
+                uint16_t new_conn_handle = event->connect.conn_handle;
 
-                ESP_LOGI(TAG, "Conexion BLE establecida");
+                struct ble_gap_conn_desc desc;
+                if (ble_gap_conn_find(new_conn_handle, &desc) == 0 &&
+                    ble_mac_is_blocked(desc.peer_id_addr.val)) {
+                    const uint8_t *mac = desc.peer_id_addr.val;
+                    ESP_LOGW(TAG, "Conexion BLE rechazada (MAC bloqueada): %02X:%02X:%02X:%02X:%02X:%02X",
+                        mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+                    ble_gap_terminate(new_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                    return rc;
+                }
+
+                bleConnHandle = new_conn_handle;
+
+                if (ble_gap_conn_find(bleConnHandle, &desc) == 0) {
+                    const uint8_t *mac = desc.peer_id_addr.val;
+                    ESP_LOGI(TAG, "Conexion BLE establecida, MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                        mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+
+                    int32_t mac_hi = ((int32_t)mac[5] << 8) | mac[4];
+                    int32_t mac_lo = ((int32_t)mac[3] << 24) | ((int32_t)mac[2] << 16) |
+                                      ((int32_t)mac[1] << 8)  |  (int32_t)mac[0];
+                    hmi_send_data(HMI_REG_BLUETOOTH_MAC_HI, mac_hi);
+                    hmi_send_data(HMI_REG_BLUETOOTH_MAC_LO, mac_lo);
+                } else {
+                    ESP_LOGI(TAG, "Conexion BLE establecida (no se pudo leer la MAC del peer)");
+                }
 
                 hmi_send_data(HMI_REG_BLUETOOTH_INDICATOR, (int32_t)255);
 
