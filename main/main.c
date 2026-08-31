@@ -89,10 +89,19 @@
 #define J1_DIN1      9
 #define J2_DIN0      3
 
-// En 1: boton J1 cicla intensidad de luz (25/50/75/100%/apagado) en vez de centrar servo3
-#define J1_BUTTON_LIGHT_MODE 1
-#define J1_LIGHT_PWM_MAX     1023  /* rango real del led_pwm del robot (TABLAS_MODBUS.md) */
-#define J1_LIGHT_STEPS       4     /* 25/50/75/100% */
+// Comportamientos posibles para los botones J1/J2, seleccionables desde el HMI
+// (HMI_REG_J1_BUTTON_MODE / HMI_REG_J2_BUTTON_MODE) y persistidos en NVS. La
+// misma lista aplica a los dos botones, sin atar ninguna funcion a un boton fijo.
+typedef enum {
+    BTN_MODE_CENTER_SRV3      = 0,  // Centrar servo3
+    BTN_MODE_LED               = 1,  // Ciclar intensidad de luz (25/50/75/100%/apagado)
+    BTN_MODE_CENTER_HEAD_NECK  = 2,  // Centrar cabeza/cuello + cancelar giro automatico
+    BTN_MODE_CAPTURE           = 3,  // Placeholder: avisa al HMI, sin accion propia todavia
+    BTN_MODE_MAX
+} joy_button_mode_t;
+
+#define LED_PWM_MAX   1023  /* rango real del led_pwm del robot (TABLAS_MODBUS.md) */
+#define LED_STEPS     4     /* 25/50/75/100% */
 
 // INPUT ENCODER
 #define ENC_A_DIN0   12
@@ -143,6 +152,8 @@
 #define NVS_KEY_srv2_max    "srv2_max"
 #define NVS_KEY_srv3_min    "srv3_min"
 #define NVS_KEY_srv3_max    "srv3_max"
+#define NVS_KEY_J1_BTN_MODE "j1_btnmode"
+#define NVS_KEY_J2_BTN_MODE "j2_btnmode"
 
 //*****************************************DEFINICIONES MODBUS*****************************************************/
 #define MB_UART_PORT           UART_NUM_1
@@ -208,6 +219,8 @@ typedef enum {
     HMI_REG_RL1                 = 0x24,  // RX: 1=enciende RL1 (coil 0x0004 del robot), 0=apaga
     HMI_REG_ROBOT_MODEL         = 0x25,  // TX: modelo del robot (Modbus input 0x000C): 0=RD80, 1=RD90, 2=RD100
     HMI_REG_RL2                 = 0x26,  // RX: 1=enciende RL2 (coil 0x0005 del robot), 0=apaga
+    HMI_REG_J1_BUTTON_MODE      = 0x27,  // BIDI: modo del boton J1 (ver joy_button_mode_t: 0=centrar srv3, 1=LED, 2=centrar cabeza/cuello, 3=captura)
+    HMI_REG_J2_BUTTON_MODE      = 0x28,  // BIDI: modo del boton J2 (mismos valores que J1_BUTTON_MODE)
     HMI_REG_BLUETOOTH_MAC_HI    = 0x29,  // TX: MAC BLE del dispositivo conectado, bits[15:0]=bytes 5-4
     HMI_REG_BLUETOOTH_MAC_LO    = 0x2A,  // TX: MAC BLE del dispositivo conectado, bytes 3-0 (manda despues de MAC_HI)
 
@@ -260,6 +273,8 @@ typedef enum {
     //   se puede agregar mas adelante si hace falta desbloqueo individual).
     // ================================================================
     HMI_REG_BLUETOOTH_UNBLOCK_ALL = 0x2D, // RX: 1=borra toda la lista negra de MACs BLE bloqueadas
+    HMI_REG_J1_CAPTURE_EVENT      = 0x2E, // TX: se presiono J1 estando en BTN_MODE_CAPTURE (value=1). Placeholder, sin accion propia en la consola todavia.
+    HMI_REG_J2_CAPTURE_EVENT      = 0x2F, // TX: se presiono J2 estando en BTN_MODE_CAPTURE (value=1). Placeholder, sin accion propia en la consola todavia.
     HMI_CMD_MAX
 } hmi_reg_t;
 
@@ -319,6 +334,8 @@ void save_center_to_nvs(void);
 void load_center_from_nvs(void);
 void save_limits_to_nvs(void);
 void load_limits_from_nvs(void);
+void save_button_modes_to_nvs(void);
+void load_button_modes_from_nvs(void);
 void load_ble_blocklist_from_nvs(void);
 void save_ble_blocklist_to_nvs(void);
 bool ble_mac_is_blocked(const uint8_t *mac);
@@ -340,10 +357,13 @@ void ble_store_config_init (void);
 
 int  gattSvcInit (void);
 void gattSvrSubscribeCb (struct ble_gap_event *event);
-int tiltChrAccess (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
-int battChrAccess (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
-int tempChrAccess (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
-int encChrAccess  (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+int tiltChrAccess    (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+int battChrAccess    (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+int tempChrAccess    (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+int encChrAccess     (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+int captureChrAccess (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+int fwVerChrAccess   (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+void ble_notify_capture_event (void);
 
 //**************************************PROTOTIPOS DE FUNCIONES TAREAS*******************************************/
 void vTaskEncoder        (void *pvParameters);
@@ -394,20 +414,44 @@ static const ble_uuid128_t encChrUuid = BLE_UUID128_INIT(
     0x04,0xC0,0xF1,0xA1,0x12,0x12,0xEF,0xDE,
     0x15,0x23,0x78,0x5F,0xEA,0xBC,0x00,0x00);
 
+// c005: boton de captura. Read + Notify. Payload = 1 byte: contador de
+// pulsaciones (uint8, 0-255 con wrap) que corre desde el arranque. La consola
+// notifica en cada flanco de pulsacion cuando J1 o J2 esta en BTN_MODE_CAPTURE.
+// El cliente lee c005 al conectarse (valor base) y con cada notify sabe cuantas
+// pulsaciones hubo. Su sola presencia le sirve a la app para saber que este
+// firmware soporta la funcion (ver tambien c006).
+static const ble_uuid128_t captureChrUuid = BLE_UUID128_INIT(
+    0x05,0xC0,0xF1,0xA1,0x12,0x12,0xEF,0xDE,
+    0x15,0x23,0x78,0x5F,0xEA,0xBC,0x00,0x00);
+
+// c006: version de protocolo/firmware. Read-only, payload = 4 bytes:
+//   [0] = BLE_PROTO_VERSION (version del protocolo GATT; subir al agregar chars)
+//   [1] = firmware major, [2] = minor, [3] = patch (de esp_app_get_description)
+static const ble_uuid128_t fwVerChrUuid = BLE_UUID128_INIT(
+    0x06,0xC0,0xF1,0xA1,0x12,0x12,0xEF,0xDE,
+    0x15,0x23,0x78,0x5F,0xEA,0xBC,0x00,0x00);
+
+#define BLE_PROTO_VERSION   1   /* v1: chars c001-c004 + c005 (captura) + c006 (version) */
+
 uint16_t tiltChrValHandle;
 uint16_t battChrValHandle;
 uint16_t tempChrValHandle;
 uint16_t encChrValHandle;
+uint16_t captureChrValHandle;
+uint16_t fwVerChrValHandle;
 
-notify_state_t tiltNotify  = {0};
-notify_state_t battNotify  = {0};
-notify_state_t tempNotify  = {0};
-notify_state_t encNotify   = {0};
+notify_state_t tiltNotify    = {0};
+notify_state_t battNotify    = {0};
+notify_state_t tempNotify    = {0};
+notify_state_t encNotify     = {0};
+notify_state_t captureNotify = {0};
 
 int16_t appTilt[2]    = {0, 0};
 int16_t appBattery[2] = {0, 0};
 int16_t appTemp       = 0;
 int32_t appEncoder    = 0;
+uint8_t appCaptureEvt = 0;   // contador de pulsaciones de captura (para clientes que leen c005 en vez de suscribirse)
+static volatile bool s_capture_notify_pending = false;  // lo pone vTaskJoystickControl en cada pulsacion; lo consume vTaskNimbleNotify
 
 static const struct ble_gatt_svc_def gattSrvServices[] = {
     {
@@ -437,6 +481,18 @@ static const struct ble_gatt_svc_def gattSrvServices[] = {
                 .val_handle = &encChrValHandle,
                 .uuid       = &encChrUuid.u,
                 .access_cb  = encChrAccess,
+            },
+            {
+                .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &captureChrValHandle,
+                .uuid       = &captureChrUuid.u,
+                .access_cb  = captureChrAccess,
+            },
+            {
+                .flags      = BLE_GATT_CHR_F_READ,
+                .val_handle = &fwVerChrValHandle,
+                .uuid       = &fwVerChrUuid.u,
+                .access_cb  = fwVerChrAccess,
             },
             {0}
         }
@@ -502,6 +558,10 @@ static int16_t srv2_min = 0;
 static int16_t srv2_max = 180;
 static int16_t srv3_min = 0;
 static int16_t srv3_max = 180;//maximo 270
+
+// Modo de cada boton del joystick, configurable desde el HMI y persistido en NVS.
+static joy_button_mode_t j1_button_mode = BTN_MODE_LED;              // default J1 = LED
+static joy_button_mode_t j2_button_mode = BTN_MODE_CENTER_HEAD_NECK; // default J2 = centrado (comportamiento original)
 
 //************************************** FUNCIONES DE INTERRUPCION *********************************************/
 void IRAM_ATTR encoder_a_isr_handler (void *arg)
@@ -670,6 +730,9 @@ void app_main(void)
     int major = 0, minor = 0, patch = 0;
     sscanf(esp_app_get_description()->version, "%d.%d.%d", &major, &minor, &patch);
     hmi_send_data(HMI_REG_FW_VERSION, ((int32_t)major << 16) | ((int32_t)minor << 8) | (int32_t)patch);
+
+    hmi_send_data(HMI_REG_J1_BUTTON_MODE, (int32_t)j1_button_mode);
+    hmi_send_data(HMI_REG_J2_BUTTON_MODE, (int32_t)j2_button_mode);
 }
 
 
@@ -717,8 +780,44 @@ void vTaskNimbleNotify (void *pvParameters)
             }
         }
 
+        // Evento de captura: solo se notifica cuando hubo una pulsacion nueva
+        // (s_capture_notify_pending), no en cada ciclo. El payload es el
+        // contador absoluto appCaptureEvt, asi que si se pierde un notify el
+        // siguiente igual trae el total al dia.
+        if (s_capture_notify_pending) {
+            if (captureNotify.notifyEnabled) {
+                notifyBuf = ble_hs_mbuf_from_flat(&appCaptureEvt, sizeof(appCaptureEvt));
+                if (notifyBuf) {
+                    int rc = ble_gatts_notify_custom(captureNotify.subConnHandle, captureChrValHandle, notifyBuf);
+                    if (rc == 0) {
+                        s_capture_notify_pending = false;
+                    }
+                }
+            } else {
+                // Nadie suscrito: se descarta el pendiente (el contador queda
+                // disponible por READ igual).
+                s_capture_notify_pending = false;
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+}
+
+
+// Evento de boton de captura -> notifica c005 (1 byte 0x01). Se llama desde
+// vTaskJoystickControl en el flanco de pulsacion cuando J1/J2 estan en
+// BTN_MODE_CAPTURE. ble_gatts_notify_custom toma el mutex del host NimBLE
+// internamente, asi que es seguro llamarlo desde esta tarea.
+void ble_notify_capture_event (void)
+{
+    // Contador de pulsaciones (uint8, 0-255 con wrap). Corre desde el arranque
+    // de la consola. El cliente puede leer c005 al conectarse para tomar el
+    // valor base y luego, con cada notify, saber cuantas pulsaciones hubo
+    // (delta). El notify en si lo manda vTaskNimbleNotify (misma tarea que
+    // notifica el resto de caracteristicas); aca solo se marca el pendiente.
+    appCaptureEvt++;
+    s_capture_notify_pending = true;
 }
 
 
@@ -841,6 +940,22 @@ void vTaskGiroAutomatico(void *pvParameters)
 }
 
 
+// Ciclo compartido de intensidad de luz (25/50/75/100%/apagado), usado por
+// cualquiera de los dos botones (J1/J2) cuando estan en BTN_MODE_LED.
+static void joy_button_cycle_led(uint8_t *step, const char *who)
+{
+    *step = (uint8_t)((*step + 1) % (LED_STEPS + 1));
+    uint16_t pwm = (uint16_t)((uint32_t)(*step) * LED_PWM_MAX / LED_STEPS);
+
+    portENTER_CRITICAL(&paramLock);
+    mb_led_pwm_updated = true;
+    mb_cmd.led_pwm     = pwm;
+    portEXIT_CRITICAL(&paramLock);
+
+    hmi_send_data(HMI_REG_ROBOT_LED_CHANGED, (int32_t)pwm);
+    ESP_LOGI(TAG, "%s: intensidad de luz -> %d%% (pwm=%d)", who, (*step) * (100 / LED_STEPS), pwm);
+}
+
 void vTaskJoystickControl (void *pvParameters)
 {
     uint16_t joy1_x, joy1_y, joy2_x, joy2_y;
@@ -848,10 +963,9 @@ void vTaskJoystickControl (void *pvParameters)
     motor_dir_t cmd = MOTOR_STOP, prev_cmd = MOTOR_STOP;
     uint16_t vel = 0, prev_vel = 0;
 
-#if J1_BUTTON_LIGHT_MODE
-    uint8_t j1_light_step = 0;   /* 0=apagado, 1=25%, 2=50%, 3=75%, 4=100% */
-    int     j1_prev_level = 1;  /* pull-up: 1=suelto, 0=presionado */
-#endif
+    uint8_t light_step  = 0;   /* compartido J1/J2: 0=apagado, 1=25%, 2=50%, 3=75%, 4=100% */
+    int     j1_prev_level = 1; /* pull-up: 1=suelto, 0=presionado */
+    int     j2_prev_level = 1;
 
     srv1_angle = center_srv1; prev_srv1 = 0;
     srv2_angle = center_srv2; prev_srv2 = 0;
@@ -979,30 +1093,26 @@ void vTaskJoystickControl (void *pvParameters)
         if (srv3_angle < target_srv3) srv3_angle++;
         else if (srv3_angle > target_srv3) srv3_angle--;
 
-        // J2 → centrar srv1/srv2 y cancelar giro automático.
-        // Mantenido 5s o mas: reinicia la consola (mismo mecanismo seguro que
-        // usan los watchdogs -- para el motor primero y le da tiempo a salir
-        // por Modbus antes de reiniciar).
+        // Boton J2 mantenido 5s o mas: reinicia la consola, sea cual sea el modo
+        // configurado (mismo mecanismo seguro que usan los watchdogs -- para el
+        // motor primero y le da tiempo a salir por Modbus antes de reiniciar).
+        // Independiente de joy_button_mode a proposito: es un boton de
+        // recuperacion fisico, no debe desaparecer si J2 se reconfigura.
         static int64_t s_center_btn_press_start_us = 0;
         static bool    s_center_btn_restart_triggered = false;
         const int64_t  CENTER_BTN_RESTART_US = 5000000;  // 5s
 
-        if (gpio_get_level(J2_DIN0) == 0)
-        {
-            if (giro_auto_active) {
-                giro_auto_active = false;
-                giro_fase = GIRO_IDLE;
-                ESP_LOGW(TAG, "Giro Automático CANCELADO por botón");
-            }
-            target_srv1 = center_srv1;
-            target_srv2 = center_srv2;
+        int j2_level = gpio_get_level(J2_DIN0);
+        bool j2_pressed_edge = (j2_prev_level == 1 && j2_level == 0);
 
+        if (j2_level == 0)
+        {
             if (s_center_btn_press_start_us == 0) {
                 s_center_btn_press_start_us = esp_timer_get_time();
             } else if (!s_center_btn_restart_triggered &&
                        (esp_timer_get_time() - s_center_btn_press_start_us) >= CENTER_BTN_RESTART_US) {
                 s_center_btn_restart_triggered = true;
-                ESP_LOGW(TAG, "Boton de centrado mantenido 5s -> parando motor y reiniciando consola");
+                ESP_LOGW(TAG, "Boton J2 mantenido 5s -> parando motor y reiniciando consola");
 
                 portENTER_CRITICAL(&paramLock);
                 mb_cmd.motor_cmd = MOTOR_STOP;
@@ -1020,31 +1130,80 @@ void vTaskJoystickControl (void *pvParameters)
             s_center_btn_restart_triggered = false;
         }
 
-#if J1_BUTTON_LIGHT_MODE
-        // J1 → cicla intensidad de luz (25/50/75/100%/apagado) por flanco de presion
+        // J2 → accion segun el modo configurado (HMI_REG_J2_BUTTON_MODE)
+        switch (j2_button_mode) {
+            case BTN_MODE_CENTER_HEAD_NECK:
+                if (j2_level == 0) {
+                    if (giro_auto_active) {
+                        giro_auto_active = false;
+                        giro_fase = GIRO_IDLE;
+                        ESP_LOGW(TAG, "Giro Automático CANCELADO por botón");
+                    }
+                    target_srv1 = center_srv1;
+                    target_srv2 = center_srv2;
+                }
+                break;
+            case BTN_MODE_CENTER_SRV3:
+                if (j2_level == 0) {
+                    target_srv3 = center_srv3;
+                }
+                break;
+            case BTN_MODE_LED:
+                if (j2_pressed_edge) {
+                    joy_button_cycle_led(&light_step, "J2");
+                }
+                break;
+            case BTN_MODE_CAPTURE:
+                if (j2_pressed_edge) {
+                    hmi_send_data(HMI_REG_J2_CAPTURE_EVENT, 1);
+                    ble_notify_capture_event();
+                    ESP_LOGI(TAG, "J2: evento Captura");
+                }
+                break;
+            default:
+                break;
+        }
+        j2_prev_level = j2_level;
+
+        // J1 → accion segun el modo configurado (HMI_REG_J1_BUTTON_MODE)
         {
             int j1_level = gpio_get_level(J1_DIN1);
-            if (j1_prev_level == 1 && j1_level == 0) {
-                j1_light_step = (j1_light_step + 1) % (J1_LIGHT_STEPS + 1);
-                uint16_t pwm = (uint16_t)((uint32_t)j1_light_step * J1_LIGHT_PWM_MAX / J1_LIGHT_STEPS);
+            bool j1_pressed_edge = (j1_prev_level == 1 && j1_level == 0);
 
-                portENTER_CRITICAL(&paramLock);
-                mb_led_pwm_updated = true;
-                mb_cmd.led_pwm     = pwm;
-                portEXIT_CRITICAL(&paramLock);
-
-                hmi_send_data(HMI_REG_ROBOT_LED_CHANGED, (int32_t)pwm);
-                ESP_LOGI(TAG, "J1: intensidad de luz -> %d%% (pwm=%d)", j1_light_step * (100 / J1_LIGHT_STEPS), pwm);
+            switch (j1_button_mode) {
+                case BTN_MODE_LED:
+                    if (j1_pressed_edge) {
+                        joy_button_cycle_led(&light_step, "J1");
+                    }
+                    break;
+                case BTN_MODE_CENTER_SRV3:
+                    if (j1_level == 0) {
+                        target_srv3 = center_srv3;
+                    }
+                    break;
+                case BTN_MODE_CENTER_HEAD_NECK:
+                    if (j1_level == 0) {
+                        if (giro_auto_active) {
+                            giro_auto_active = false;
+                            giro_fase = GIRO_IDLE;
+                            ESP_LOGW(TAG, "Giro Automático CANCELADO por botón (J1)");
+                        }
+                        target_srv1 = center_srv1;
+                        target_srv2 = center_srv2;
+                    }
+                    break;
+                case BTN_MODE_CAPTURE:
+                    if (j1_pressed_edge) {
+                        hmi_send_data(HMI_REG_J1_CAPTURE_EVENT, 1);
+                        ble_notify_capture_event();
+                        ESP_LOGI(TAG, "J1: evento Captura");
+                    }
+                    break;
+                default:
+                    break;
             }
             j1_prev_level = j1_level;
         }
-#else
-        // J1 → centrar srv3
-        if (gpio_get_level(J1_DIN1) == 0)
-        {
-            target_srv3 = center_srv3;
-        }
-#endif
 
         // RAMPA SUAVE (1°)
         if (srv1_angle < target_srv1) {
@@ -1952,6 +2111,30 @@ void hmi_handle_reg(uint8_t reg, int32_t value)
         break;
         /*************************************************************/
 
+        case HMI_REG_J1_BUTTON_MODE:
+        if (value >= 0 && value < BTN_MODE_MAX) {
+            j1_button_mode = (joy_button_mode_t)value;
+            save_button_modes_to_nvs();
+            hmi_send_data(HMI_REG_J1_BUTTON_MODE, (int32_t)j1_button_mode); // confirma al HMI
+            ESP_LOGI(TAG, "HMI_REG_J1_BUTTON_MODE = %d", j1_button_mode);
+        } else {
+            ESP_LOGW(TAG, "HMI_REG_J1_BUTTON_MODE: valor invalido %d", (int)value);
+        }
+        break;
+        /*************************************************************/
+
+        case HMI_REG_J2_BUTTON_MODE:
+        if (value >= 0 && value < BTN_MODE_MAX) {
+            j2_button_mode = (joy_button_mode_t)value;
+            save_button_modes_to_nvs();
+            hmi_send_data(HMI_REG_J2_BUTTON_MODE, (int32_t)j2_button_mode); // confirma al HMI
+            ESP_LOGI(TAG, "HMI_REG_J2_BUTTON_MODE = %d", j2_button_mode);
+        } else {
+            ESP_LOGW(TAG, "HMI_REG_J2_BUTTON_MODE: valor invalido %d", (int)value);
+        }
+        break;
+        /*************************************************************/
+
         case HMI_REG_BLUETOOTH_DISCONNECT:
         if (value == 1) {
             if (bleConnHandle != BLE_HS_CONN_HANDLE_NONE) {
@@ -2053,6 +2236,30 @@ void load_limits_from_nvs(void)
         if (nvs_get_i16(handle, NVS_KEY_srv3_max, &val) == ESP_OK) srv3_max = val;
         nvs_close(handle);
         ESP_LOGI(TAG, "Limites cargados NVS: srv1=%d-%d srv2=%d-%d srv3=%d-%d", srv1_min, srv1_max, srv2_min, srv2_max, srv3_min, srv3_max);
+    }
+}
+
+void save_button_modes_to_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, NVS_KEY_J1_BTN_MODE, (uint8_t)j1_button_mode);
+        nvs_set_u8(handle, NVS_KEY_J2_BTN_MODE, (uint8_t)j2_button_mode);
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Modos de botones guardados NVS: J1=%d J2=%d", j1_button_mode, j2_button_mode);
+    }
+}
+
+void load_button_modes_from_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+        uint8_t val;
+        if (nvs_get_u8(handle, NVS_KEY_J1_BTN_MODE, &val) == ESP_OK && val < BTN_MODE_MAX) j1_button_mode = (joy_button_mode_t)val;
+        if (nvs_get_u8(handle, NVS_KEY_J2_BTN_MODE, &val) == ESP_OK && val < BTN_MODE_MAX) j2_button_mode = (joy_button_mode_t)val;
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Modos de botones cargados NVS: J1=%d J2=%d", j1_button_mode, j2_button_mode);
     }
 }
 
@@ -2183,6 +2390,7 @@ void vHardwareInit (void)
 	vMbMasterInit();
     load_center_from_nvs();
     load_limits_from_nvs();
+    load_button_modes_from_nvs();
     load_ble_blocklist_from_nvs();
 
 	ESP_LOGI(TAG, "Configuracion de drivers ESP-IDF exitoso");
@@ -2417,7 +2625,59 @@ int encChrAccess(uint16_t connHandle, uint16_t attrHandle, struct ble_gatt_acces
     return BLE_ATT_ERR_UNLIKELY;
 }
 
-void onStackReset (int reason) 
+// c005 (READ): devuelve el contador de pulsaciones de captura (uint8, con wrap).
+// Es un fallback para clientes que prefieren hacer polling en vez de
+// suscribirse a las notificaciones; si el valor cambio, hubo una captura.
+int captureChrAccess(uint16_t connHandle, uint16_t attrHandle, struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int rc;
+
+    switch (ctxt->op)
+    {
+        case BLE_GATT_ACCESS_OP_READ_CHR:
+            if (attrHandle == captureChrValHandle) {
+                rc = os_mbuf_append(ctxt->om, &appCaptureEvt, sizeof(appCaptureEvt));
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+// c006 (READ): version de protocolo + version de firmware (4 bytes).
+int fwVerChrAccess(uint16_t connHandle, uint16_t attrHandle, struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int rc;
+
+    switch (ctxt->op)
+    {
+        case BLE_GATT_ACCESS_OP_READ_CHR:
+            if (attrHandle == fwVerChrValHandle) {
+                int major = 0, minor = 0, patch = 0;
+                sscanf(esp_app_get_description()->version, "%d.%d.%d", &major, &minor, &patch);
+                uint8_t buf[4] = {
+                    (uint8_t)BLE_PROTO_VERSION,
+                    (uint8_t)major,
+                    (uint8_t)minor,
+                    (uint8_t)patch,
+                };
+                rc = os_mbuf_append(ctxt->om, buf, sizeof(buf));
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+void onStackReset (int reason)
 {
     ESP_LOGI(TAG, "NimBLE stack se ha resetado, razon: %d", reason);
 }
@@ -2619,6 +2879,10 @@ void gattSvrSubscribeCb (struct ble_gap_event *event)
     else if (attr_handle == encChrValHandle) {
         encNotify.subConnHandle = conn_handle;
         encNotify.notifyEnabled = event->subscribe.cur_notify;
+    }
+    else if (attr_handle == captureChrValHandle) {
+        captureNotify.subConnHandle = conn_handle;
+        captureNotify.notifyEnabled = event->subscribe.cur_notify;
     }
 }
 

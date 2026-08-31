@@ -3,4 +3,4 @@
 cmake_minimum_required(VERSION 3.22)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(WP_C_V9_UP VERSION 1.1.4)
+project(WP_C_V9_UP VERSION 1.2.0)

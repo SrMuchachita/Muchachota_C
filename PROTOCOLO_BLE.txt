@@ -1,0 +1,241 @@
+===============================================================================
+ PROTOCOLO BLE - Consola RD90Pro  (firmware WP_C_V9_UP)
+===============================================================================
+ Lee este archivo ANTES de agregar cualquier funcion nueva por BLE.
+ Es el equivalente a la tabla del HMI (enum hmi_reg_t en main.c), pero para BLE.
+
+ Todo lo que se menciona esta en:  main/main.c
+ Herramienta para ver/probar en vivo:  tools/ble_monitor.py   (pip install bleak)
+-------------------------------------------------------------------------------
+
+
+1) DATOS GENERALES
+-------------------------------------------------------------------------------
+ Nombre de anuncio BLE (DEVICE_NAME) .... "RD90Pro"
+ Service UUID .......................... 4cc885f6-f3d0-45fe-add5-2d29e1310e01
+ Rol .................................. Peripheral (la consola). El central es IRIS / la laptop.
+ Conexiones ........................... 1 central a la vez (ver punto 6).
+
+ Formato de UUID de las caracteristicas:
+   String estandar:  0000bcea-5f78-2315-deef-1212a1f1c00N     (N = 1..6, hoy)
+   En main.c se declaran con BLE_UUID128_INIT, que toma los bytes AL REVES:
+   el primer byte del arreglo es "c00N", el resto es fijo:
+       0xN, 0xC0,0xF1,0xA1,0x12,0x12,0xEF,0xDE,0x15,0x23,0x78,0x5F,0xEA,0xBC,0x00,0x00
+   O sea: para una caracteristica nueva "c007" -> primer byte 0x07, lo demas igual.
+
+ Todos los enteros van LITTLE-ENDIAN, structs sin relleno (os_mbuf_append tal cual).
+
+
+2) CARACTERISTICAS ACTUALES
+-------------------------------------------------------------------------------
+ UUID (sufijo) | Nombre     | Props        | Payload
+ --------------+------------+--------------+--------------------------------------
+ c001          | tilt       | Read+Notify  | int16[2] LE = [eje_y, eje_x]  (grados x100, crudo)
+ c002          | battery    | Read+Notify  | int16[2] LE = [bat_consola_mV, bat_robot_crudo]
+ c003          | temp       | Read+Notify  | int16   LE = temperatura (grados x100, crudo)
+ c004          | encoder    | Read+Notify  | int32   LE = pulsos del encoder
+ c005          | capture    | Read+Notify  | uint8      = contador de pulsaciones del boton
+               |            |              |             de captura (0..255, wrap).
+               |            |              |   Notify: en cada pulsacion (flanco), cuando J1 o
+               |            |              |             J2 esta en BTN_MODE_CAPTURE.
+               |            |              |   Read  : el cliente lo lee al conectar (valor base)
+               |            |              |             y el delta contra el base = pulsaciones
+               |            |              |             ocurridas mientras estuvo conectado.
+ c006          | fw/version | Read         | uint8[4] = [proto_ver, fw_major, fw_minor, fw_patch]
+               |            |              |   proto_ver = BLE_PROTO_VERSION (#define en main.c).
+               |            |              |   La app lo lee al conectar para saber que soporta
+               |            |              |   esta consola. Subir proto_ver al agregar cosas.
+
+ Variables espejo en firmware (lo que se notifica/lee):
+   appTilt[2], appBattery[2], appTemp, appEncoder, appCaptureEvt
+   La version sale de esp_app_get_description()->version.
+
+
+3) COMO FUNCIONA UN "EVENTO" HOY (ejemplo: boton de captura)  --- patron a copiar
+-------------------------------------------------------------------------------
+ El patron que FUNCIONA para mandar un evento consola->app es:
+
+   a) El evento se detecta en su tarea (ej. vTaskJoystickControl, flanco de boton).
+   b) Esa tarea NO llama a ble_gatts_notify_custom directo. Solo:
+        - actualiza la variable espejo (ej. appCaptureEvt++)
+        - marca un flag  (ej. s_capture_notify_pending = true)
+   c) vTaskNimbleNotify (la tarea que ya notifica tilt/batt/temp/enc) ve el flag
+      cada 100 ms, manda el notify con ble_gatts_notify_custom, y limpia el flag
+      solo si el notify salio OK (rc == 0).
+   d) El payload es un valor ABSOLUTO (contador), no un "1". Asi, si se pierde un
+      notify (BLE notify no tiene ACK), el siguiente igual trae el total al dia.
+
+ IMPORTANTE: notificar desde otra tarea que no sea vTaskNimbleNotify daba
+ problemas (llegaba solo el primer notify). SIEMPRE notificar desde
+ vTaskNimbleNotify via flag/cola.
+
+ La suscripcion del cliente se registra en gattSvrSubscribeCb: ahi se guarda
+ conn_handle y cur_notify en la struct notify_state_t correspondiente.
+
+
+4) RECETA: AGREGAR UN EVENTO NUEVO  consola -> IRIS
+-------------------------------------------------------------------------------
+ Hay dos caminos. Para 1-2 cosas puntuales sirve el A. Si vas a agregar varias,
+ hace el B una sola vez y despues todo entra sin tocar la tabla GATT.
+
+
+ -------- OPCION A: caracteristica dedicada nueva (rapido, no escala) ----------
+
+ Ej.: agregar "cXXX" = evento "robot desconectado".
+
+ En main.c, en este orden:
+
+ [1] UUID:  al lado de los otros *ChrUuid (~ linea 398-432)
+       static const ble_uuid128_t nuevoChrUuid = BLE_UUID128_INIT(
+           0xXX,0xC0,0xF1,0xA1,0x12,0x12,0xEF,0xDE,
+           0x15,0x23,0x78,0x5F,0xEA,0xBC,0x00,0x00);      // XX = 07, 08, ...
+
+ [2] Handle + estado:  al lado de captureChrValHandle / captureNotify (~440-447)
+       uint16_t       nuevoChrValHandle;
+       notify_state_t nuevoNotify = {0};
+       <tipo> appNuevo = 0;                 // variable espejo del valor
+       static volatile bool s_nuevo_notify_pending = false;
+
+ [3] Prototipo del access_cb:  junto a los otros (~358-365)
+       int nuevoChrAccess (uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+       void ble_notify_nuevo_event (void);     // si querras dispararlo desde otra tarea
+
+ [4] Entrada en la tabla GATT gattSrvServices[]:  antes del {0} final (~455-490)
+       {
+           .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+           .val_handle = &nuevoChrValHandle,
+           .uuid       = &nuevoChrUuid.u,
+           .access_cb  = nuevoChrAccess,
+       },
+
+ [5] access_cb (para el READ):  copiar captureChrAccess (~2610). Devuelve appNuevo.
+
+ [6] Suscripcion:  en gattSvrSubscribeCb agregar la rama (~2850)
+       else if (attr_handle == nuevoChrValHandle) {
+           nuevoNotify.subConnHandle = conn_handle;
+           nuevoNotify.notifyEnabled = event->subscribe.cur_notify;
+       }
+
+ [7] Envio del notify:  en vTaskNimbleNotify, copiar el bloque de captura (~760)
+       if (s_nuevo_notify_pending) {
+           if (nuevoNotify.notifyEnabled) {
+               notifyBuf = ble_hs_mbuf_from_flat(&appNuevo, sizeof(appNuevo));
+               if (notifyBuf) {
+                   int rc = ble_gatts_notify_custom(nuevoNotify.subConnHandle,
+                                                    nuevoChrValHandle, notifyBuf);
+                   if (rc == 0) s_nuevo_notify_pending = false;
+               }
+           } else {
+               s_nuevo_notify_pending = false;
+           }
+       }
+
+ [8] Disparo:  donde ocurre el evento, en su tarea:
+       appNuevo = <valor>;
+       s_nuevo_notify_pending = true;
+
+ [9] Subir BLE_PROTO_VERSION (#define en main.c, ~434).
+ [10] Agregar la fila en la tabla del punto 2 de este archivo.
+ [11] tools/ble_monitor.py: agregar la entrada en CHAR_DEFS y su decode en
+      decode_payload().
+
+
+ -------- OPCION B: canal generico de eventos (hacer 1 vez, despues escala) ----
+
+ Idea: UNA caracteristica c007 "EVENT" (Read+Notify) que lleva un frame con id +
+ valor, igual que el HMI hace {reg, value}. Agregar un evento nuevo = un id nuevo
+ en un enum + una llamada. NO se toca la tabla GATT ni hay re-discovery.
+
+ Caracteristica c007 "EVENT"  (Read + Notify)
+   Payload = 6 bytes LE:
+       evt_id : u8    -> que evento (enum ble_evt_id_t)
+       seq    : u8    -> +1 por evento (wrap 255); la app detecta si perdio alguno
+       value  : i32   -> dato del evento
+
+ (Opcional, mismo momento) c008 "COMMAND"  (Write)  IRIS -> consola
+   Payload = 6 bytes LE:  cmd_id:u8, rsv:u8, value:i32
+   En el access_cb de c008, caso BLE_GATT_ACCESS_OP_WRITE_CHR: parsear y
+   switch(cmd_id) { ... }   <- igual que hmi_handle_reg().
+
+ Tabla de eventos (enum ble_evt_id_t en main.c, documentar aca):
+
+   evt_id | nombre              | value
+   -------+---------------------+------------------------------------------------
+   0x01   | BLE_EVT_CAPTURE     | contador de pulsaciones del boton de captura
+   0x02   | (libre)             |
+   0x03   | (libre)             |
+   ...    |                     |
+
+ Tabla de comandos (enum ble_cmd_id_t en main.c), si se agrega c008:
+
+   cmd_id | nombre              | value
+   -------+---------------------+------------------------------------------------
+   0x01   | (libre)             |
+   ...    |                     |
+
+ Firmware para B:
+   - helper  ble_evt_send(uint8_t evt_id, int32_t value)
+       -> arma el frame, seq++, lo mete en una cola FreeRTOS (como xQueueHmiTx).
+   - vTaskNimbleNotify saca de la cola y hace ble_gatts_notify_custom sobre c007.
+   - Agregar un evento nuevo desde cualquier tarea:  ble_evt_send(BLE_EVT_XXX, v);
+
+ Despues de B, "mandar algo nuevo a IRIS" = agregar un evt_id a la tabla de
+ arriba + llamar ble_evt_send(...). Nada mas.
+
+
+5) REGLAS Y GOTCHAS
+-------------------------------------------------------------------------------
+ - Notificar SIEMPRE desde vTaskNimbleNotify (via flag o cola). No desde la
+   tarea que genera el evento (llegaba solo el primer notify).
+
+ - BLE notify NO tiene ACK: puede perderse. Por eso mandar valor absoluto
+   (contador), no pulsos "1". La app lee la caracteristica al conectar (base) y
+   trabaja con el delta. Si un evento es critico y no se puede perder, usar
+   INDICATE (BLE_GATT_CHR_F_INDICATE) en vez de NOTIFY: tiene ACK, pero es mas
+   lento y solo 1 pendiente a la vez.
+
+ - Al agregar/quitar caracteristicas cambia la tabla GATT -> los clientes con
+   cache GATT (Windows/BlueZ, moviles ya emparejados) tienen que re-descubrir o
+   se les limpia el cache / se re-emparejan. Con la OPCION B esto NO pasa: la
+   tabla no cambia.
+
+ - Subir BLE_PROTO_VERSION (#define en main.c) cada vez que se agrega un evt_id,
+   cmd_id o caracteristica. La app lee c006 al conectar para saber que soporta.
+
+ - Subir tambien la version del proyecto en CMakeLists.txt (project ... VERSION).
+
+ - Espejar SIEMPRE el cambio en tools/ble_monitor.py (CHAR_DEFS + decode_payload)
+   para poder probar sin depender de IRIS.
+
+ - La suscripcion (CCCD) del cliente se registra en gattSvrSubscribeCb. Si un
+   notify "no llega", revisar por serie las lineas "SUBSCRIBE: ..." y comparar
+   attr_handle con el *ChrValHandle correspondiente.
+
+
+6) CONEXION 1 A LA VEZ  (pendiente de implementar - punto 3 del pedido)
+-------------------------------------------------------------------------------
+ Hoy CONFIG_BT_NIMBLE_MAX_CONNECTIONS = 3 y no hay rechazo explicito de una 2da
+ conexion. Plan acordado (no implementado aun):
+   - Guard en gapEventHandler / BLE_GAP_EVENT_CONNECT: si ya hay bleConnHandle,
+     ble_gap_terminate() del nuevo y return.
+   - CONFIG_BT_NIMBLE_MAX_CONNECTIONS = 1 en sdkconfig.defaults + sdkconfig.
+
+
+7) DONDE ESTA CADA COSA EN main.c  (aprox., buscar por nombre)
+-------------------------------------------------------------------------------
+ DEVICE_NAME ................................ #define, ~linea 56
+ BLE_PROTO_VERSION ......................... #define, ~linea 434
+ robotSvcUuid / *ChrUuid .................... ~398-432
+ *ChrValHandle / *Notify / app* ............ ~436-453
+ gattSrvServices[] (tabla GATT) ............ ~455-490
+ notify_state_t (struct) .................. ~305
+ Prototipos BLE (access_cb, helpers) ...... ~330-365
+ vTaskNimbleNotify (manda notifys) ........ ~710-790
+ ble_notify_capture_event ................. ~795
+ Disparo captura (BTN_MODE_CAPTURE) ....... vTaskJoystickControl, ~1140 y ~1180
+ *ChrAccess (read callbacks) .............. ~2468-2660
+ captureChrAccess / fwVerChrAccess ........ ~2610-2660
+ gapEventHandler (connect/disc/subscribe) . ~2763-2827
+ gattSvrSubscribeCb (registra CCCD) ....... ~2850
+ startAdvertising ........................ ~2695
+===============================================================================
